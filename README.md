@@ -145,7 +145,10 @@ with `pdbq` and `objdump` (disassembly of the exact function, named by the PDB):
   totals); without the call a `give` into a storage chest was missing from the network total, and
   taking the items out by hand later drove it negative. For containers it is
   `ItemFrequencyCounter::setup`, inserter wake-up, `reevaluateSignalsToSend` and
-  `LogisticPoint::reInitSupply` (a full recount). A paused game runs no tick: nothing is changed.
+  `LogisticPoint::reInitSupply` (a full recount). That call wakes only the inserters waiting for room
+  (`inputWakeUpList`); the stub also runs `WakeUpList::alarm` on every wake-up list the owner has
+  (`inputWakeUpList`, `outputWakeUpList`, a car's `wakeUpList`), so inserters waiting for items wake
+  after a fill, as after the game's own insert. A paused game runs no tick: nothing is changed.
 - **`train fill`.** From the open wagon or locomotive window the train is walked through
   `RollingStock.connectedToFront/Back` (a wagon can face either way, so each step takes the link that
   is not where it came from). Cargo wagons get `give`'s placement; fluid wagons get their `Fluid` set
@@ -174,9 +177,6 @@ with `pdbq` and `objdump` (disassembly of the exact function, named by the PDB):
 
 ## Known limits
 
-- **Inserters can stay asleep.** Inserters waiting on a chest sleep on its `inputWakeUpList` /
-  `outputWakeUpList`, and only the game's transfers wake them. After `chest fill`, drop or take one
-  item by hand to wake them.
 - **Ore map label lags.** The map's ore label updates after a re-chart or reload; tooltips and miners
   see the new amount at once. Ore 0 is refused (the game cannot clean up a zero tile written from
   outside; use 1).

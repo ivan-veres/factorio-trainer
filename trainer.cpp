@@ -227,7 +227,7 @@ u64 size(const char* tname) {
 
 // ---------------------------------------------------------------- layout
 struct Layout {
-  u64 sGlobal, sItems, sFluids, sInvHook, sFluHook, sOreHook, sSortHook;
+  u64 sGlobal, sItems, sFluids, sInvHook, sFluHook, sOreHook, sSortHook, sAlarm;
   u64 gcGame, gameLocalPlayer, playerController, playerPhysical, playerStashed, playerBeforePause, vtCharCtrl, ctrlPlayer, ccCharacter, targeterTarget, charInventory;
   u64 stackSize, stackCount, stackId, stackItem, stackOwner;
   u64 invData, invSize, invFirstNonFull, invLastNonEmpty;
@@ -252,6 +252,7 @@ bool loadLayout() {
   L.sFluHook = sym("FluidSegment::addToDescription");             // RCX = segment
   L.sOreHook = sym("ResourceEntity::addToDescription");           // RCX = entity
   L.sSortHook = sym("Controller::checkSortInventoryAfterUpdate");  // end of tick, update thread
+  L.sAlarm = sym("WakeUpList::alarm");  // wakes every inserter sleeping on one list
 
   L.gcGame = off("GlobalContext", "game");
   L.gameLocalPlayer = off("Game", "localPlayer");
@@ -746,13 +747,21 @@ template <class F, class X = void (*)(), class P = void (*)(const std::vector<si
 int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const std::vector<std::string>& labels = {},
                     P plan = [](const std::vector<size_t>&) {}) {
   std::vector<u64> owners, fns;
-  for (u64 inv : invs) {
-    u64 owner = ptr(inv + L.invOwner), fn = owner ? ptr(ptr(owner) + 0x18) : 0;
+  std::vector<std::vector<u64>> wakeLists(invs.size());
+  for (size_t i = 0; i < invs.size(); ++i) {
+    u64 owner = ptr(invs[i] + L.invOwner), fn = owner ? ptr(ptr(owner) + 0x18) : 0;
     if (fn && !pdb::nameAt(fn).ends_with("::inventorySorted")) {
       std::puts("Refused: the owner's vtable changed shape (inventorySorted not at slot 0x18) - re-check after a game update.");
       return 0;
     }
     owners.push_back(owner); fns.push_back(fn);
+    // ContainerEntity::inventorySorted alarms only the input list (inserters waiting for room); the
+    // ones waiting for items sleep on the output list until the game's own insert alarms it.
+    u64 ent = owner ? owner - L.entPost : 0;
+    std::string cls = ent && pdb::nameAt(ptr(ent)).ends_with("::`vftable'") ? className(ent) : "";
+    if (!cls.empty())
+      for (const char* m : {"inputWakeUpList", "outputWakeUpList", "wakeUpList"})
+        if (auto o = pdb::tryOff(cls.c_str(), m)) wakeLists[i].push_back(owner - L.entPost + *o);
   }
   enum Why { OK, GONE, LIMITS };
   std::vector<Why> why(invs.size(), OK);
@@ -774,6 +783,7 @@ int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const
       wr<u16>(inv + L.invFirstNonFull, firstNonFull(inv));
       wr<u16>(inv + L.invLastNonEmpty, lastNonEmpty(inv));
       if (fns[i]) calls.push_back({fns[i], owners[i], inv});
+      for (u64 list : wakeLists[i]) calls.push_back({L.sAlarm, list, 0});
       ++edited;
     }
     extra();
