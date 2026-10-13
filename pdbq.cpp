@@ -88,9 +88,12 @@ bool dumpType(const char* name) {
   return true;
 }
 
+int printed = 0;  // symbols shown: exit 1 when a query showed none
+
 BOOL CALLBACK onSym(PSYMBOL_INFO si, ULONG, PVOID dataOnly) {
   bool isData = si->Tag == T_DATA;
   if (dataOnly && !isData) return TRUE;
+  ++printed;
   std::printf("%-5s rva %08llX  size %5lX  %s\n", isData ? "data" : "func", si->Address - BASE, si->Size, si->Name);
   return TRUE;
 }
@@ -124,7 +127,7 @@ int main(int argc, char** argv) {
       if (SymFromAddr(h, BASE + strtoull(argv[i], nullptr, 16), &disp, si)) std::printf("%s = %s+0x%llX\n", argv[i], si->Name, disp);
       else { std::printf("%s = ?\n", argv[i]); ok = false; }
   }
-  else ok = SymEnumSymbols(h, BASE, argv[2], onSym, cmd == "data" ? (PVOID)1 : nullptr);
+  else ok = SymEnumSymbols(h, BASE, argv[2], onSym, cmd == "data" ? (PVOID)1 : nullptr) && printed > 0;
   SymCleanup(h);
   return ok ? 0 : 1;
 }

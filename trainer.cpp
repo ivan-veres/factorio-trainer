@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -44,6 +45,20 @@ constexpr double FLUID_SCALE = 16777216.0;  // fluid amounts are int64 fixed poi
 constexpr int OIL_REACH = 12;               // max tile gap between wells of one field
 
 // ---------------------------------------------------------------- process
+// Output while the game is stopped is held and printed after it resumes: a console write blocks
+// while text is selected in the window (QuickEdit), and the game would stay frozen with it.
+std::string held;
+bool holding = false;
+
+void say(const char* fmt, ...) {
+  char buf[1024];
+  va_list a;
+  va_start(a, fmt);
+  std::vsnprintf(buf, sizeof buf, fmt, a);
+  va_end(a);
+  if (holding) held += buf; else std::fputs(buf, stdout);
+}
+
 struct Game {
   DWORD pid = 0;
   HANDLE proc = nullptr;
@@ -402,6 +417,8 @@ void setDrAll(u64 addr) {
 // One-shot hardware execute breakpoint on every thread: the first thread that reaches
 // `addr` is handed to onHit(CONTEXT&) (control + integer registers; return true to write
 // them back), then the breakpoint is cleared and the debugger detaches. False on timeout.
+DWORD hitThread = 0;  // the thread trap() handed to onHit
+
 template <class F> bool trap(u64 addr, const char* hint, DWORD timeoutMs, F onHit) {
   if (!DebugActiveProcess(g.pid)) {
     std::printf("Could not attach the debugger (%lu). Is Cheat Engine attached?\n", GetLastError());
@@ -430,6 +447,7 @@ template <class F> bool trap(u64 addr, const char* hint, DWORD timeoutMs, F onHi
             c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
             if (th && GetThreadContext(th, &c)) {
               result = true;
+              hitThread = e.dwThreadId;
               if (onHit(c)) SetThreadContext(th, &c);
             }
             if (th) CloseHandle(th);
@@ -482,18 +500,22 @@ struct GameCall { u64 fn, a1, a2; };
 // (game paused) - then nothing ran.
 //
 // The stub is allocated before the game stops, sized for maxCalls, so a re-sync can never fail to fit
-// after the edits are made. It is freed at the next edit, not when its flag is seen: the flag is
-// set two instructions before the stub's last jump.
-u64 stubToFree = 0;
+// after the edits are made. Its done flag is set two instructions before its last jump, so seeing the
+// flag does not prove the thread left it: an old stub is freed only inside a later stop where the
+// thread that ran it is the one stopped at the hook, outside every stub.
+struct OldStub { u64 mem; DWORD thread; };
+std::vector<OldStub> oldStubs;
 
 template <class F> bool atEndOfTick(F frozen, size_t maxCalls = 0) {
-  if (stubToFree) { VirtualFreeEx(g.proc, (LPVOID)stubToFree, 0, MEM_RELEASE); stubToFree = 0; }
   u64 size = 64 + 32 * (u64)maxCalls;  // 37 bytes of frame and exit, 32 per call; flag at the start
   u64 mem = maxCalls ? (u64)VirtualAllocEx(g.proc, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) : 0;
   if (maxCalls && !mem) { std::puts("Could not allocate the re-sync stub - nothing changed."); return false; }
   u64 flag = mem, code0 = mem + 16;
   bool detoured = false;
   bool hit = trap(L.sSortHook, nullptr, 3000, [&](CONTEXT& c) {
+    std::erase_if(oldStubs, [](const OldStub& o) {
+      return o.thread == hitThread && VirtualFreeEx(g.proc, (LPVOID)o.mem, 0, MEM_RELEASE);
+    });
     cache.on = true;
     std::vector<GameCall> calls = frozen();
     cache = {};
@@ -527,19 +549,20 @@ template <class F> bool atEndOfTick(F frozen, size_t maxCalls = 0) {
     if (mem) VirtualFreeEx(g.proc, (LPVOID)mem, 0, MEM_RELEASE);  // never entered
     return hit;
   }
+  oldStubs.push_back({mem, hitThread});  // freed later, once that thread is provably out of it
   for (int i = 0; i < 200; ++i, Sleep(10))
-    if (rd<uint8_t>(flag).value_or(0)) {
-      stubToFree = mem;
-      return true;
-    }
+    if (rd<uint8_t>(flag).value_or(0)) return true;
   std::puts("Warning: the game's re-sync call did not report back - network counts and chest icon may be stale.");
-  return true;  // ponytail: stub left allocated; it may still be running
+  return true;
 }
 
 // f() with the game stopped at the end of a tick, for writes that need no re-sync call (fluids, ore);
 // false when no tick came (paused) - then nothing ran.
 template <class F> bool frozenDo(F f) {
-  return atEndOfTick([&] { f(); return std::vector<GameCall>{}; });
+  bool ran = atEndOfTick([&] { holding = true; f(); holding = false; return std::vector<GameCall>{}; });
+  std::fputs(held.c_str(), stdout);
+  held.clear();
+  return ran;
 }
 
 const char* NO_TICK = "Nothing changed: the game ran no tick (paused?) or the debugger could not attach.";
@@ -834,7 +857,6 @@ template <class F> bool editInventory(u64 inv, F edit) {
 void invSet(u32 slot, u32 count) {
   u64 inv = picked();
   if (!inv) return;
-  bool mine = inv == myInventory();
   std::string why;
   // Slot, item and stack size are read inside the game stop: the inventory can be reallocated
   // (armor, research) or the slot refilled by an inserter during the tick the trainer waits for.
@@ -846,7 +868,7 @@ void invSet(u32 slot, u32 count) {
         // Inventory::canInsertCount adds stackSize - count as unsigned 32-bit: an overstacked slot
         // wraps it and the game promises room that is not there. Only your own inventory, where a
         // ctrl+click transfer splits the stack again.
-        if (it != items.end() && count > it->second.stack && !mine) {
+        if (it != items.end() && count > it->second.stack && inv != myInventory()) {
           why = "more than a stack (" + std::to_string(it->second.stack) + ") only in your own inventory (`inv`)";
           return;
         }
@@ -1498,7 +1520,7 @@ void trainFill(const std::vector<std::string>& names) {
       if (!still(j.sid) || !rd(j.sid.ent + L.fwFluid, cur)) continue;
       j.cap = rd<int64_t>(j.sid.ent + L.fwCapacity).value_or(0);
       if ((cur.id && cur.amount > 0 && cur.id != j.id) || j.cap <= 0 || cur.amount >= j.cap) continue;
-      Fl f{j.id, cur.pad, j.temp, j.cap};
+      Fl f{j.id, cur.pad, cur.id == j.id && cur.amount > 0 ? cur.temperature : j.temp, j.cap};
       if (wr(j.sid.ent + L.fwFluid, f)) { j.added = j.cap - (cur.id == j.id ? cur.amount : 0); changed = true; }
     }
     if (changed && still(first)) stampActivity(first.ent);
@@ -1582,11 +1604,11 @@ bool looksLikeSegment(u64 b) {
 }
 
 void fluShow() {
-  if (!fluSeg || !looksLikeSegment(fluSeg)) { std::puts("No live segment - use `fluid` (stale after pipe changes)."); return; }
+  if (!fluSeg || !looksLikeSegment(fluSeg)) { say("No live segment - use `fluid` (stale after pipe changes).\n"); return; }
   u16 id = *rd<u16>(fluSeg + L.fluId);
   double amt = *rd<int64_t>(fluSeg + L.fluAmt) / FLUID_SCALE, vol = *rd<int64_t>(fluSeg + L.fluVol) / FLUID_SCALE;
   std::string name = fluids.count(id) ? fluids[id] : "id " + std::to_string(id);
-  std::printf("Segment %llX  %s  %.0f / %.0f (%.0f%%)  %.1f C\n", fluSeg, name.c_str(), amt, vol, 100 * amt / vol,
+  say("Segment %llX  %s  %.0f / %.0f (%.0f%%)  %.1f C\n", fluSeg, name.c_str(), amt, vol, 100 * amt / vol,
               rd<float>(fluSeg + L.fluTemp).value_or(0));
 }
 
@@ -1624,24 +1646,24 @@ u64 openFluidSegment(std::string* what = nullptr) {
 void fillWithNow(const std::string& name) {
   std::string cls;
   u64 seg = openFluidSegment(&cls);
-  if (!seg) { std::puts("Open the window of a storage tank or pipe first (no window, or that entity has no fluid box)."); return; }
+  if (!seg) { say("Open the window of a storage tank or pipe first (no window, or that entity has no fluid box).\n"); return; }
   u16 fid = 0;
   for (auto& [i, n] : fluids) if (n == name) fid = (u16)i;
-  if (!fid) { std::printf("No fluid named '%s' (try `find`).\n", name.c_str()); return; }
+  if (!fid) { say("No fluid named '%s' (try `find`).\n", name.c_str()); return; }
   u64 proto = ptr(ptr(L.sFluids) + fid * 8);
 
   u16 cur = rd<u16>(seg + L.fluId).value_or(0xFFFF);
   int64_t amt = rd<int64_t>(seg + L.fluAmt).value_or(-1), vol = rd<int64_t>(seg + L.fluVol).value_or(0);
-  if (vol <= 0 || amt < 0 || amt > vol) { std::puts("That does not read like a fluid network - refused."); return; }
+  if (vol <= 0 || amt < 0 || amt > vol) { say("That does not read like a fluid network - refused.\n"); return; }
   if (cur && cur != fid && amt > 0) {
-    std::printf("Refused: the network holds %s. `fluid` + `empty` it first, or pick %s.\n", fluids[cur].c_str(), fluids[cur].c_str());
+    say("Refused: the network holds %s. `fluid` + `empty` it first, or pick %s.\n", fluids[cur].c_str(), fluids[cur].c_str());
     return;
   }
   // A building with a fluid filter (boiler input, machine recipe) pins the network's fluid and temperature range.
   bool filtered = rd<u64>(seg + L.fluFilterCount).value_or(1) != 0;
   u16 ffid = rd<u16>(seg + L.fluFilterId).value_or(0);
   float fmin = rd<float>(seg + L.fluFilterMin).value_or(0), fmax = rd<float>(seg + L.fluFilterMax).value_or(0);
-  if (filtered && ffid && ffid != fid) { std::printf("Refused: a building on this network only accepts %s.\n", fluids[ffid].c_str()); return; }
+  if (filtered && ffid && ffid != fid) { say("Refused: a building on this network only accepts %s.\n", fluids[ffid].c_str()); return; }
 
   // Directly connected boxes that would not mix must share one segment. A neighbour segment
   // across a plain two-way connection means the game keeps them apart on purpose: refuse.
@@ -1653,7 +1675,7 @@ void fillWithNow(const std::string& name) {
       u64 opp = ptr(target + L.boxConnBegin) + rd<u16>(c + L.connOpposite).value_or(0) * L.connSize;
       uint8_t flags = rd<uint8_t>(c + L.connFlags).value_or(0) | rd<uint8_t>(opp + L.connFlags).value_or(0);
       if (!(flags & 0x8) && !rd<uint8_t>(c + L.connType).value_or(1) && !rd<uint8_t>(opp + L.connType).value_or(1)) {
-        std::puts("Refused: this network touches another network that the game keeps separate.");
+        say("Refused: this network touches another network that the game keeps separate.\n");
         return;
       }
     }
@@ -1666,11 +1688,11 @@ void fillWithNow(const std::string& name) {
   // Fluid {fluidID, temperature, amount} in one write so the checker never sees a half state.
   struct { u16 id; u16 pad; float temperature; int64_t amount; } fluid{};
   static_assert(sizeof fluid == 16);
-  if (L.fluTemp != L.fluId + 4 || L.fluAmt != L.fluId + 8 || !rd(seg + L.fluId, fluid)) { std::puts("Fluid layout changed - refused."); return; }
+  if (L.fluTemp != L.fluId + 4 || L.fluAmt != L.fluId + 8 || !rd(seg + L.fluId, fluid)) { say("Fluid layout changed - refused.\n"); return; }
   fluid.id = fid; fluid.temperature = temp; fluid.amount = vol;
-  if (!wr(seg + L.fluId, fluid)) { std::puts("Write failed."); return; }
+  if (!wr(seg + L.fluId, fluid)) { say("Write failed.\n"); return; }
   fluSeg = seg;
-  std::printf("%s: filled with %s at %.1f C.\n", cls.c_str(), name.c_str(), temp);
+  say("%s: filled with %s at %.1f C.\n", cls.c_str(), name.c_str(), temp);
   fluShow();
 }
 
@@ -1683,11 +1705,11 @@ void fillWith(const std::string& name) {
 void emptyOpenNow() {
   std::string cls;
   u64 seg = openFluidSegment(&cls);
-  if (!seg) { std::puts("Open the window of a storage tank or pipe first."); return; }
+  if (!seg) { say("Open the window of a storage tank or pipe first.\n"); return; }
   struct { u16 id; u16 pad; float temperature; int64_t amount; } fluid{};
-  if (L.fluTemp != L.fluId + 4 || L.fluAmt != L.fluId + 8 || !rd(seg + L.fluId, fluid)) { std::puts("Fluid layout changed - refused."); return; }
+  if (L.fluTemp != L.fluId + 4 || L.fluAmt != L.fluId + 8 || !rd(seg + L.fluId, fluid)) { say("Fluid layout changed - refused.\n"); return; }
   fluid.id = 0; fluid.temperature = 0; fluid.amount = 0;
-  std::puts(wr(seg + L.fluId, fluid) ? "Emptied." : "Write failed.");
+  say("%s\n", wr(seg + L.fluId, fluid) ? "Emptied." : "Write failed.");
 }
 
 void emptyOpen() {
