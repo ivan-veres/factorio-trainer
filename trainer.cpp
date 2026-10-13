@@ -572,15 +572,20 @@ bool looksLikeInventory(u64 a) {
 // same object: same inventory vtable, same owner, same owner vtable.
 struct Pick { u64 inv = 0, invVt = 0, owner = 0, ownerVt = 0; } pick;
 
-void setPick(u64 inv) {
+Pick pickOf(u64 inv) {
   u64 owner = inv ? ptr(inv + L.invOwner) : 0;
-  pick = inv ? Pick{inv, ptr(inv), owner, owner ? ptr(owner) : 0} : Pick{};
+  return inv ? Pick{inv, ptr(inv), owner, owner ? ptr(owner) : 0} : Pick{};
 }
 
-bool samePick(u64 inv) {
-  return inv && inv == pick.inv && looksLikeInventory(inv) && ptr(inv) == pick.invVt &&
-         ptr(inv + L.invOwner) == pick.owner && (!pick.owner || ptr(pick.owner) == pick.ownerVt);
+void setPick(u64 inv) { pick = pickOf(inv); }
+
+// Still the same inventory of the same owner (a reload or a mined chest frees and reuses the memory).
+bool stillThere(const Pick& p) {
+  return p.inv && looksLikeInventory(p.inv) && ptr(p.inv) == p.invVt && ptr(p.inv + L.invOwner) == p.owner &&
+         (!p.owner || ptr(p.owner) == p.ownerVt);
 }
+
+bool samePick(u64 inv) { return inv && inv == pick.inv && stillThere(pick); }
 
 // The picked inventory, or 0 (with a message) when nothing is picked or it is gone.
 u64 picked() {
@@ -734,10 +739,12 @@ u16 lastNonEmpty(u64 inv) {
 // totals (LogisticPoint supplies). So the update thread makes the call Inventory::sort ends with,
 // owner->inventorySorted(inventory), slot 0x18 of the owner's PostTransferNotifiable vtable.
 // ContainerEntity/LogisticContainer::inventorySorted rebuild the frequency counter, wake inserters,
-// re-evaluate signals and reInitSupply (recount). `extra` runs in the same stop (fluid wagons).
+// re-evaluate signals and reInitSupply (recount). `extra` runs in the same stop (fluid wagons);
+// `plan` gets the indices that passed the checks, before the first edit.
 // Returns how many inventories were edited; -1 when nothing ran (paused).
-template <class F, class X = void (*)()> int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {},
-                                                           const std::vector<std::string>& labels = {}) {
+template <class F, class X = void (*)(), class P = void (*)(const std::vector<size_t>&)>
+int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const std::vector<std::string>& labels = {},
+                    P plan = [](const std::vector<size_t>&) {}) {
   std::vector<u64> owners, fns;
   for (u64 inv : invs) {
     u64 owner = ptr(inv + L.invOwner), fn = owner ? ptr(ptr(owner) + 0x18) : 0;
@@ -752,11 +759,17 @@ template <class F, class X = void (*)()> int editInventories(const std::vector<u
   int edited = 0;
   bool ran = atEndOfTick([&] {
     std::vector<GameCall> calls;
+    std::vector<size_t> ok;
     for (size_t i = 0; i < invs.size(); ++i) {
       u64 inv = invs[i];
       if (!looksLikeInventory(inv) || ptr(inv + L.invOwner) != owners[i]) { why[i] = GONE; continue; }
       if (firstNonFull(inv) != rd<u16>(inv + L.invFirstNonFull).value_or(0xFFFF) ||
           lastNonEmpty(inv) != rd<u16>(inv + L.invLastNonEmpty).value_or(0xFFFF)) { why[i] = LIMITS; continue; }
+      ok.push_back(i);
+    }
+    plan(ok);  // sees every inventory that will be edited before any is (balance)
+    for (size_t i : ok) {
+      u64 inv = invs[i];
       edit(i);
       wr<u16>(inv + L.invFirstNonFull, firstNonFull(inv));
       wr<u16>(inv + L.invLastNonEmpty, lastNonEmpty(inv));
@@ -1016,6 +1029,12 @@ bool chestFill(const std::string& name = "") {
 // back at it. Labels say where each one is.
 struct Block { std::vector<u64> invs; std::vector<std::string> labels; };
 
+// "<prototype name> at x,y" (tiles).
+std::string entityLabel(u64 ent) {
+  return readStdString(ptr(ent + L.entProto) + L.protoName).value_or("?") + " at " +
+         std::to_string(rd<int32_t>(ent + L.entX).value_or(0) >> 8) + "," + std::to_string(rd<int32_t>(ent + L.entY).value_or(0) >> 8);
+}
+
 Block openBlock() {
   u64 ent = openEntity();
   if (!mainInventory(ent)) { std::puts("Open one chest of the block first."); return {}; }
@@ -1027,11 +1046,7 @@ Block openBlock() {
   std::string kind = readStdString(proto + L.protoName).value_or("?");
   Block b;
   for (u64 a : block)
-    if (u64 inv = mainInventory(a)) {
-      b.invs.push_back(inv);
-      b.labels.push_back(kind + " at " + std::to_string(rd<int32_t>(a + L.entX).value_or(0) >> 8) + "," +
-                         std::to_string(rd<int32_t>(a + L.entY).value_or(0) >> 8));
-    }
+    if (u64 inv = mainInventory(a)) { b.invs.push_back(inv); b.labels.push_back(entityLabel(a)); }
   std::printf("Block: %zu %s.\n", b.invs.size(), kind.c_str());
   return b;
 }
@@ -1239,6 +1254,109 @@ void chestClear(bool all, const std::vector<std::string>& names) {
   if (editInventories(b.invs, [&](size_t i) { clearStacks(b.invs[i], ids, removed, kept); }, [] {}, b.labels) < 0) return;
   printRemoved(removed, kept);
   if (removed.empty()) std::puts("  nothing to remove");
+}
+
+// Chests picked one by one (`chest add`), wherever they are; re-checked before every use.
+std::vector<Pick> chestList;
+std::vector<std::string> chestLabels;
+
+void chestAdd() {
+  u64 ent = openEntity(), inv = mainInventory(ent);
+  if (!inv) { std::puts("No chest, wagon or car window open."); return; }
+  for (auto& p : chestList) if (p.inv == inv) { std::puts("Already in the list."); return; }
+  chestList.push_back(pickOf(inv));
+  chestLabels.push_back(entityLabel(ent));
+  std::printf("Added %s (%zu in the list).\n", chestLabels.back().c_str(), chestList.size());
+}
+
+void chestShowList() {
+  if (chestList.empty()) std::puts("The list is empty: open a chest, `chest add`; repeat.");
+  for (size_t k = 0; k < chestList.size(); ++k)
+    std::printf("  %zu  %s%s\n", k + 1, chestLabels[k].c_str(), stillThere(chestList[k]) ? "" : "  (gone)");
+}
+
+// Split `total` over chests with room `cap`: smallest room first, each takes what fits of an even
+// share and the rest share the remainder. Empty when it does not all fit.
+constexpr std::vector<u64> shares(const std::vector<u64>& cap, u64 total) {
+  std::vector<size_t> order(cap.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return cap[x] < cap[y]; });
+  std::vector<u64> out(cap.size());
+  for (size_t k = 0; k < order.size(); ++k) {
+    size_t i = order[k];
+    out[i] = std::min(cap[i], (total + order.size() - k - 1) / (order.size() - k));
+    total -= out[i];
+  }
+  return total ? std::vector<u64>{} : out;
+}
+static_assert(shares({100, 100, 100}, 10) == std::vector<u64>{4, 3, 3});
+static_assert(shares({2, 100, 100}, 10) == std::vector<u64>{2, 4, 4});
+static_assert(shares({1, 1}, 3).empty());
+
+// Even out one item over the listed chests (or the open chest's block) in one game stop: every
+// simple normal-quality stack of it is taken out and the total put back in equal shares. A chest
+// with less room (bar, filters, other items) gets what fits and the others share the rest, so
+// nothing is created or lost. Other qualities and stacks with item data stay where they are.
+void chestBalance(bool all, const std::string& name) {
+  Block b;
+  if (all) b = openBlock();
+  else
+    for (size_t k = 0; k < chestList.size(); ++k)
+      if (stillThere(chestList[k])) { b.invs.push_back(chestList[k].inv); b.labels.push_back(chestLabels[k]); }
+      else std::printf("%s: gone - skipped (`chest reset` and add it again).\n", chestLabels[k].c_str());
+  if (b.invs.size() < 2) {
+    std::puts(all ? "Nothing to balance: the block has one chest." : "Add at least two chests: open one, `chest add`; repeat.");
+    return;
+  }
+  u32 id = name.empty() ? firstItem(b.invs[0]) : itemId(name);
+  if (!id) { if (name.empty()) std::puts("The first chest is empty - name an item: chest balance <item>."); return; }
+  size_t n = b.invs.size();
+  std::vector<Placement> pls(n);
+  for (size_t k = 0; k < n; ++k) if (!canGive(b.invs[k], id, pls[k])) return;  // says why
+  u32 stack = items[id].stack;
+  auto movable = [&](u64 a) {
+    return rd<u16>(a + L.stackId).value_or(0) == id && !ptr(a + L.stackItem) && rd<u8>(a + L.stackQuality).value_or(0) == pls[0].normal;
+  };
+  std::vector<u64> had(n), target(n), placed(n);
+  u64 total = 0;
+  bool planned = false;
+  auto plan = [&](const std::vector<size_t>& ok) {
+    std::vector<u64> cap(n);
+    for (size_t i : ok) {
+      u64 arr = ptr(b.invs[i] + L.invData);
+      u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
+      for (u32 s = 0; s < size; ++s) {
+        u64 a = arr + s * L.stackSize;
+        bool mine = movable(a);
+        if (mine) had[i] += rd<u32>(a + L.stackCount).value_or(0);
+        if (s < pls[i].limit && (mine || (rd<u64>(a).value_or(1) == 0 && !ptr(a + L.stackItem))) && pls[i].accepts(s, id)) cap[i] += stack;
+      }
+      total += had[i];
+    }
+    std::vector<u64> okCap;
+    for (size_t i : ok) okCap.push_back(cap[i]);
+    auto split = shares(okCap, total);
+    for (size_t k = 0; k < split.size(); ++k) target[ok[k]] = split[k];
+    planned = ok.size() >= 2 && !split.empty();
+  };
+  int edited = editInventories(b.invs, [&](size_t i) {
+    if (!planned) return;
+    u64 arr = ptr(b.invs[i] + L.invData);
+    u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
+    for (u32 s = 0; s < size; ++s) if (movable(arr + s * L.stackSize)) wr<u64>(arr + s * L.stackSize, 0);
+    placed[i] = placeItems(b.invs[i], pls[i], id, target[i]);
+  }, [] {}, b.labels, plan);
+  if (edited < 0) return;
+  const char* item = items[id].name.c_str();
+  if (!planned) { std::printf("Refused: %llu %s do not fit back in (items beyond a bar?) - nothing changed.\n", total, item); return; }
+  std::printf("Balanced %llu %s over %d chests:\n", total, item, edited);
+  u64 lost = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!had[i] && !target[i]) continue;
+    std::printf("  %-40s %8llu -> %llu\n", b.labels[i].c_str(), had[i], placed[i]);
+    lost += target[i] - placed[i];
+  }
+  if (lost) std::printf("WARNING: %llu %s could not be placed back.\n", lost, item);
 }
 
 // Empty the open train in one game stop: without names every simple stack of every cargo wagon and
@@ -1592,6 +1710,8 @@ const char* HELP = R"(Commands:
   chest fill [item]   fill its free slots with the item in its first slot (or the named one)
   chest clear [items] empty it (everything, or only the named items)
   chest fill all [item] / chest clear all [items]  the same for every chest of that kind in its block
+  chest add | list | reset   pick chests anywhere: open one, `chest add`; repeat
+  chest balance [all] [item] even out an item over the picked chests (all: the open chest's block)
   train fill [names]  open wagon/locomotive: fill every wagon of its train (own item/fluid, or the named ones)
   train clear [names] empty every wagon of the train (everything, or only the named items/fluids)
   inv click           capture: then click an item in any inventory (car, wagon, ...)
@@ -1646,12 +1766,13 @@ int main(int argc, char** argv) {
     rest >> cmd >> arg;
     if (cmd == "quit" || cmd == "exit") break;
     else if (cmd == "inv") arg == "click" ? invClick() : invMine();
-    else if (cmd == "chest" && (arg == "fill" || arg == "clear")) {
+    else if (cmd == "chest" && (arg == "fill" || arg == "clear" || arg == "balance")) {
       std::vector<std::string> names;
       for (std::string n; rest >> n;) names.push_back(n);
       bool all = !names.empty() && names[0] == "all";
       if (all) names.erase(names.begin());
       if (arg == "clear") chestClear(all, names);
+      else if (arg == "balance") names.size() > 1 ? (void)std::puts("Usage: chest balance [all] [item]") : chestBalance(all, names.empty() ? "" : names[0]);
       else if (names.size() > 1) std::puts("Usage: chest fill [all] [item]");
       else if (all) chestFillAll(names.empty() ? "" : names[0]);
       else chestFill(names.empty() ? "" : names[0]);
@@ -1661,6 +1782,9 @@ int main(int argc, char** argv) {
       for (std::string n; rest >> n;) names.push_back(n);
       arg == "fill" ? trainFill(names) : trainClear(names);
     }
+    else if (cmd == "chest" && arg == "add") chestAdd();
+    else if (cmd == "chest" && arg == "list") chestShowList();
+    else if (cmd == "chest" && arg == "reset") { chestList.clear(); chestLabels.clear(); std::puts("List cleared."); }
     else if (cmd == "chest") invChest();
     else if (cmd == "set") { u32 s, c; std::istringstream a(line.substr(3)); if (a >> s >> c) invSet(s, c); else std::puts("Usage: set <slot> <count>"); }
     else if (cmd == "topup") { u64 inv = picked(); int n = inv ? invTopUp(inv) : -1; if (n >= 0) std::printf("Topped up %d stacks.\n", n); }
