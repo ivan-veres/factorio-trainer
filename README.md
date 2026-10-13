@@ -149,7 +149,10 @@ with `pdbq` and `objdump` (disassembly of the exact function, named by the PDB):
   `fill <fluid>` refuses a different fluid already present, a filter for another fluid, and a
   neighbouring segment across a plain two-way connection. It writes `{id, temperature, amount}` in
   one 16-byte store, using the fluid's `defaultTemperature` clamped to the filter. `empty` writes
-  all zeros, like the flush button.
+  all zeros, like the flush button. The checks and the write run inside one end-of-tick stop (the
+  fluid system updates segments every tick, and a 16-byte copy is not atomic to it); so do the
+  Ctrl+Shift+F1 top-up and `ore set` / `oil` (a miner can exhaust and free a tile between a check and
+  a write).
 - **Edits run with the game stopped, then the game re-syncs.** `editInventory` catches the update
   thread at `Controller::checkSortInventoryAfterUpdate` (end of tick, where the game sorts
   inventories itself) with the one-shot breakpoint. While the whole process is frozen in that debug
@@ -166,6 +169,10 @@ with `pdbq` and `objdump` (disassembly of the exact function, named by the PDB):
   (`inputWakeUpList`); the stub also runs `WakeUpList::alarm` on every wake-up list the owner has
   (`inputWakeUpList`, `outputWakeUpList`, a car's `wakeUpList`), so inserters waiting for items wake
   after a fill, as after the game's own insert. A paused game runs no tick: nothing is changed.
+  Whatever was checked before the stop (slot addresses, bar, filters, the inventory's and owner's
+  vtables, fluid wagons) is checked again inside it, since the game runs for up to a tick while the
+  trainer waits. The stub is sized for the edit before the game stops and freed at the next edit (its
+  done flag is set two instructions before its last jump).
 - **`train fill`.** From the open wagon or locomotive window the train is walked through
   `RollingStock.connectedToFront/Back` (a wagon can face either way, so each step takes the link that
   is not where it came from). Cargo wagons get `give`'s placement; fluid wagons get their `Fluid` set
