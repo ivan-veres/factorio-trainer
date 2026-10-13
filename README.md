@@ -18,7 +18,7 @@ disables achievements).
 | `chest` | the chest, cargo wagon, car or spidertron whose window is open in game |
 | `chest fill [slots] [item]` | fill the open chest's free slots (up to its limit bar), or only slots `22` / `22-90`, with its first item or the named one (`chest fill 10-15 #123`); slots holding other items are left alone |
 | `chest clear [what]` | empty the open chest, or remove only what is named: items, item ids `#777`, slots `22` or ranges `22-90`, separated by spaces or commas (`chest clear stone,#777 5-20`) |
-| `chest fill all [item]` / `chest clear all [items]` | the same for every chest of that kind in its block, in one game stop |
+| `chest fill all [slots] [item]` / `chest clear all [what]` | the same for every chest of that kind in its block, in one game stop (slots: the same slots in every chest) |
 | `chest add` / `chest list` / `chest reset` | pick chests anywhere, one by one: open a chest's window, `chest add`; repeat |
 | `chest balance [item]` / `chest balance all [item]` | even out an item (normal quality, no item data) over the picked chests / the open chest's block, in one game stop; a chest with less room gets what fits, nothing is created or lost |
 | `train fill [names]` | with a wagon/locomotive window open: fill every cargo and fluid wagon (own item/fluid, or the named ones); slots `22` / `22-90` limit every cargo wagon to those slots (`train fill 0-9 #123`); names and slots take spaces or commas |

@@ -891,6 +891,19 @@ struct Selector {
   }
 };
 
+// Say which requested slots do not exist (slots run 0..size-1); once per inventory size.
+void warnSlots(const std::vector<std::pair<u32, u32>>& slots, const std::vector<u64>& invs) {
+  std::vector<u16> sizes;
+  for (u64 inv : invs)
+    if (u16 n = rd<u16>(inv + L.invSize).value_or(0); n && std::find(sizes.begin(), sizes.end(), n) == sizes.end()) sizes.push_back(n);
+  for (u16 n : sizes)
+    for (auto [a, b] : slots) {
+      std::string r = a == b ? "Slot " + std::to_string(a) : "Slots " + std::to_string(a) + "-" + std::to_string(b);
+      if (a >= n) std::printf("%s: past the last slot (%u) - ignored.\n", r.c_str(), n - 1u);
+      else if (b >= n) std::printf("%s: only %u-%u exist.\n", r.c_str(), a, n - 1u);
+    }
+}
+
 std::optional<Selector> parseSelector(const std::vector<std::string>& words) {
   Selector sel;
   for (auto& w : words) {
@@ -1012,6 +1025,7 @@ void clearPicked(const std::vector<std::string>& words) {
   auto sel = inv ? parseSelector(words) : std::nullopt;
   if (!sel) return;
   if (sel->empty()) { std::puts("Usage: clear <items, #ids, slots 22 or 22-90>"); return; }
+  warnSlots(sel->slots, {inv});
   std::map<std::string, u64> removed;
   int kept = 0;
   if (!editInventory(inv, [&] { clearStacks(inv, *sel, removed, kept); })) return;
@@ -1078,6 +1092,7 @@ bool chestFill(const Selector& sel = {}) {
   if (!pick.inv) { std::puts("No chest, wagon or car window open."); return false; }
   u32 id = sel.ids.empty() ? firstItem(pick.inv) : sel.ids[0];
   if (!id) { if (sel.ids.empty()) std::puts("The chest is empty - name an item: chest fill <item>."); return false; }
+  warnSlots(sel.slots, {pick.inv});
   give(items[id].name, FILL, sel.slots);
   return true;
 }
@@ -1111,10 +1126,11 @@ Block openBlock() {
 }
 
 // Fill every chest of the block in one game stop, each with its own first item or the named one.
-void chestFillAll(const std::string& name) {
+void chestFillAll(const std::string& name, const std::vector<std::pair<u32, u32>>& slots = {}) {
   u32 item = 0;
   if (!name.empty() && !(item = itemId(name))) return;
   Block b = openBlock();
+  warnSlots(slots, b.invs);
   std::vector<u64> invs;
   std::vector<u32> ids;
   std::vector<Placement> pls;
@@ -1126,6 +1142,7 @@ void chestFillAll(const std::string& name) {
     if (!id) { ++empty; continue; }
     Placement pl;
     if (!canGive(inv, id, pl)) continue;  // says why
+    pl.slots = slots;
     invs.push_back(inv); ids.push_back(id); pls.push_back(pl); labels.push_back(b.labels[k]);
   }
   std::map<std::string, std::pair<u64, int>> put;  // item -> (count, chests)
@@ -1259,6 +1276,7 @@ void trainFill(const std::vector<std::string>& names) {
     }
   }
   std::printf("Train: %zu vehicles, %d cargo wagons, %d fluid wagons.\n", stock.size(), cargo, fluidWagons);
+  warnSlots(slots, invs);
   if (invs.empty() && jobs.empty()) {
     std::puts(names.empty() ? "Nothing to fill (empty wagons need a name: train fill <item or fluid>)." : "Nothing to fill.");
     return;
@@ -1316,16 +1334,16 @@ void printRemoved(const std::map<std::string, u64>& removed, int kept) {
 }
 
 // Empty the open chest (one) or every chest of its block (all) in one game stop: everything, or
-// only what the selector names (items, #ids, slots; slots only for one chest).
+// only what the selector names (items, #ids, slots; with `all` the same slots in every chest).
 void chestClear(bool all, const std::vector<std::string>& words) {
   auto sel = parseSelector(words);
   if (!sel) return;
-  if (all && !sel->slots.empty()) { std::puts("Slot numbers need one chest: `chest clear <slots>` without `all`."); return; }
   Block b;
   if (all) b = openBlock();
   else if (setPick(openChest()), pick.inv) b = {{pick.inv}, {}};
   else std::puts("No chest, wagon or car window open.");
   if (b.invs.empty()) return;
+  warnSlots(sel->slots, b.invs);
   std::map<std::string, u64> removed;
   int kept = 0;
   if (editInventories(b.invs, [&](size_t i) { clearStacks(b.invs[i], *sel, removed, kept); }, [] {}, b.labels) < 0) return;
@@ -1466,6 +1484,7 @@ void trainClear(const std::vector<std::string>& names) {
     }
   }
   std::printf("Train: %zu vehicles, %d cargo wagons, %d fluid wagons.\n", stock.size(), cargo, fluidWagons);
+  warnSlots(slots, invs);
   if (invs.empty() && tanks.empty()) { std::puts("Nothing to clear."); return; }
 
   auto wanted = [](auto& list, auto id) { return list.empty() || std::find(list.begin(), list.end(), id) != list.end(); };
@@ -1855,8 +1874,7 @@ int main(int argc, char** argv) {
       else if (arg == "balance") names.size() > 1 ? (void)std::puts("Usage: chest balance [all] [item]") : chestBalance(all, names.empty() ? "" : names[0]);
       else if (auto sel = parseSelector(names); !sel) {}
       else if (sel->ids.size() > 1) std::puts("Usage: chest fill [all] [item] / chest fill <slots 22 or 22-90> [item] - one item.");
-      else if (all && !sel->slots.empty()) std::puts("Slot numbers need one chest: `chest fill <slots> [item]` without `all`.");
-      else if (all) chestFillAll(sel->ids.empty() ? "" : items[sel->ids[0]].name);
+      else if (all) chestFillAll(sel->ids.empty() ? "" : items[sel->ids[0]].name, sel->slots);
       else chestFill(*sel);
     }
     else if (cmd == "train" && (arg == "fill" || arg == "clear")) {
