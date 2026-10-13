@@ -1015,8 +1015,25 @@ u64 removeItems(u64 inv, u32 id, int* kept = nullptr) {
   return removed;
 }
 
-void clearStacks(u64 inv, const Selector& sel, std::map<std::string, u64>& removed, int& kept);
-void printRemoved(const std::map<std::string, u64>& removed, int kept);
+// Zero every simple stack the selector takes (everything when it is empty); per-name totals go to
+// `removed`, stacks with item data are counted in `kept` and left in place.
+void clearStacks(u64 inv, const Selector& sel, std::map<std::string, u64>& removed, int& kept) {
+  u64 arr = ptr(inv + L.invData);
+  u16 total = rd<u16>(inv + L.invSize).value_or(0);
+  for (u32 j = 0; j < total; ++j) {
+    u64 a = arr + j * L.stackSize;
+    u16 sid = rd<u16>(a + L.stackId).value_or(0);
+    if (!sid || !sel.takes(j, sid)) continue;
+    if (ptr(a + L.stackItem)) { ++kept; continue; }
+    u32 cnt = rd<u32>(a + L.stackCount).value_or(0);
+    if (wr<u64>(a, 0)) removed[items.count(sid) ? items[sid].name : "id " + std::to_string(sid)] += cnt;
+  }
+}
+
+void printRemoved(const std::map<std::string, u64>& removed, int kept) {
+  for (auto& [name, n] : removed) std::printf("  -%llu %s\n", n, name.c_str());
+  if (kept) std::printf("  %d stacks with item data left in place\n", kept);
+}
 
 // Remove what the selector names (items, #ids, slots) from the picked inventory; something must be
 // named, so a typo never empties your own inventory.
@@ -1085,6 +1102,7 @@ u16 firstItem(u64 inv) {
   return items.count(id) ? id : 0;
 }
 
+// ---------------------------------------------------------------- chest
 // Fill every free slot (up to the bar) of the open chest with the named item, or the item in its
 // first occupied slot.
 bool chestFill(const Selector& sel = {}) {
@@ -1156,6 +1174,127 @@ void chestFillAll(const std::string& name, const std::vector<std::pair<u32, u32>
   for (auto& [n, e] : put) std::printf("  +%llu %s (%d chests)\n", e.first, n.c_str(), e.second);
   if (full) std::printf("  %d already full\n", full);
   if (empty) std::printf("  %d empty skipped (name an item to fill those: chest fill all <item>)\n", empty);
+}
+
+// Empty the open chest (one) or every chest of its block (all) in one game stop: everything, or
+// only what the selector names (items, #ids, slots; with `all` the same slots in every chest).
+void chestClear(bool all, const std::vector<std::string>& words) {
+  auto sel = parseSelector(words);
+  if (!sel) return;
+  Block b;
+  if (all) b = openBlock();
+  else if (setPick(openChest()), pick.inv) b = {{pick.inv}, {}};
+  else std::puts("No chest, wagon or car window open.");
+  if (b.invs.empty()) return;
+  warnSlots(sel->slots, b.invs);
+  std::map<std::string, u64> removed;
+  int kept = 0;
+  if (editInventories(b.invs, [&](size_t i) { clearStacks(b.invs[i], *sel, removed, kept); }, [] {}, b.labels) < 0) return;
+  printRemoved(removed, kept);
+  if (removed.empty()) std::puts("  nothing to remove");
+}
+
+// Chests picked one by one (`chest add`), wherever they are; re-checked before every use.
+std::vector<Pick> chestList;
+std::vector<std::string> chestLabels;
+
+void chestAdd() {
+  u64 ent = openEntity(), inv = mainInventory(ent);
+  if (!inv) { std::puts("No chest, wagon or car window open."); return; }
+  for (auto& p : chestList) if (p.inv == inv) { std::puts("Already in the list."); return; }
+  chestList.push_back(pickOf(inv));
+  chestLabels.push_back(entityLabel(ent));
+  std::printf("Added %s (%zu in the list).\n", chestLabels.back().c_str(), chestList.size());
+}
+
+void chestShowList() {
+  if (chestList.empty()) std::puts("The list is empty: open a chest, `chest add`; repeat.");
+  for (size_t k = 0; k < chestList.size(); ++k)
+    std::printf("  %zu  %s%s\n", k + 1, chestLabels[k].c_str(), stillThere(chestList[k]) ? "" : "  (gone)");
+}
+
+// Split `total` over chests with room `cap`: smallest room first, each takes what fits of an even
+// share and the rest share the remainder. Empty when it does not all fit.
+constexpr std::vector<u64> shares(const std::vector<u64>& cap, u64 total) {
+  std::vector<size_t> order(cap.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return cap[x] < cap[y]; });
+  std::vector<u64> out(cap.size());
+  for (size_t k = 0; k < order.size(); ++k) {
+    size_t i = order[k];
+    out[i] = std::min(cap[i], (total + order.size() - k - 1) / (order.size() - k));
+    total -= out[i];
+  }
+  return total ? std::vector<u64>{} : out;
+}
+static_assert(shares({100, 100, 100}, 10) == std::vector<u64>{4, 3, 3});
+static_assert(shares({2, 100, 100}, 10) == std::vector<u64>{2, 4, 4});
+static_assert(shares({1, 1}, 3).empty());
+
+// Even out one item over the listed chests (or the open chest's block) in one game stop: every
+// simple normal-quality stack of it is taken out and the total put back in equal shares. A chest
+// with less room (bar, filters, other items) gets what fits and the others share the rest, so
+// nothing is created or lost. Other qualities and stacks with item data stay where they are.
+void chestBalance(bool all, const std::string& name) {
+  Block b;
+  if (all) b = openBlock();
+  else
+    for (size_t k = 0; k < chestList.size(); ++k)
+      if (stillThere(chestList[k])) { b.invs.push_back(chestList[k].inv); b.labels.push_back(chestLabels[k]); }
+      else std::printf("%s: gone - skipped (`chest reset` and add it again).\n", chestLabels[k].c_str());
+  if (b.invs.size() < 2) {
+    std::puts(all ? "Nothing to balance: the block has one chest." : "Add at least two chests: open one, `chest add`; repeat.");
+    return;
+  }
+  u32 id = name.empty() ? firstItem(b.invs[0]) : itemId(name);
+  if (!id) { if (name.empty()) std::puts("The first chest is empty - name an item: chest balance <item>."); return; }
+  size_t n = b.invs.size();
+  std::vector<Placement> pls(n);
+  for (size_t k = 0; k < n; ++k) if (!canGive(b.invs[k], id, pls[k])) return;  // says why
+  u32 stack = items[id].stack;
+  auto movable = [&](u64 a) {
+    return rd<u16>(a + L.stackId).value_or(0) == id && !ptr(a + L.stackItem) && rd<u8>(a + L.stackQuality).value_or(0) == pls[0].normal;
+  };
+  std::vector<u64> had(n), target(n), placed(n);
+  u64 total = 0;
+  bool planned = false;
+  auto plan = [&](const std::vector<size_t>& ok) {
+    std::vector<u64> cap(n);
+    for (size_t i : ok) {
+      u64 arr = ptr(b.invs[i] + L.invData);
+      u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
+      for (u32 s = 0; s < size; ++s) {
+        u64 a = arr + s * L.stackSize;
+        bool mine = movable(a);
+        if (mine) had[i] += rd<u32>(a + L.stackCount).value_or(0);
+        if (s < pls[i].limit && (mine || (rd<u64>(a).value_or(1) == 0 && !ptr(a + L.stackItem))) && pls[i].accepts(s, id)) cap[i] += stack;
+      }
+      total += had[i];
+    }
+    std::vector<u64> okCap;
+    for (size_t i : ok) okCap.push_back(cap[i]);
+    auto split = shares(okCap, total);
+    for (size_t k = 0; k < split.size(); ++k) target[ok[k]] = split[k];
+    planned = ok.size() >= 2 && !split.empty();
+  };
+  int edited = editInventories(b.invs, [&](size_t i) {
+    if (!planned) return;
+    u64 arr = ptr(b.invs[i] + L.invData);
+    u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
+    for (u32 s = 0; s < size; ++s) if (movable(arr + s * L.stackSize)) wr<u64>(arr + s * L.stackSize, 0);
+    placed[i] = placeItems(b.invs[i], pls[i], id, target[i]);
+  }, [] {}, b.labels, plan);
+  if (edited < 0) return;
+  const char* item = items[id].name.c_str();
+  if (!planned) { std::printf("Refused: %llu %s do not fit back in (items beyond a bar?) - nothing changed.\n", total, item); return; }
+  std::printf("Balanced %llu %s over %d chests:\n", total, item, edited);
+  u64 lost = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (!had[i] && !target[i]) continue;
+    std::printf("  %-40s %8llu -> %llu\n", b.labels[i].c_str(), had[i], placed[i]);
+    lost += target[i] - placed[i];
+  }
+  if (lost) std::printf("WARNING: %llu %s could not be placed back.\n", lost, item);
 }
 
 // ---------------------------------------------------------------- trains
@@ -1311,147 +1450,6 @@ void trainFill(const std::vector<std::string>& names) {
   for (auto& [name, e] : added) std::printf("  +%.0f %s (%d wagons)\n", e.first, name.c_str(), e.second);
   if (full || fullFluid) std::printf("  %d already full\n", full + fullFluid);
   if (emptyCargo || emptyFluid) std::printf("  %d empty skipped (name an item or fluid to fill those)\n", emptyCargo + emptyFluid);
-}
-
-// Zero every simple stack the selector takes (everything when it is empty); per-name totals go to
-// `removed`, stacks with item data are counted in `kept` and left in place.
-void clearStacks(u64 inv, const Selector& sel, std::map<std::string, u64>& removed, int& kept) {
-  u64 arr = ptr(inv + L.invData);
-  u16 total = rd<u16>(inv + L.invSize).value_or(0);
-  for (u32 j = 0; j < total; ++j) {
-    u64 a = arr + j * L.stackSize;
-    u16 sid = rd<u16>(a + L.stackId).value_or(0);
-    if (!sid || !sel.takes(j, sid)) continue;
-    if (ptr(a + L.stackItem)) { ++kept; continue; }
-    u32 cnt = rd<u32>(a + L.stackCount).value_or(0);
-    if (wr<u64>(a, 0)) removed[items.count(sid) ? items[sid].name : "id " + std::to_string(sid)] += cnt;
-  }
-}
-
-void printRemoved(const std::map<std::string, u64>& removed, int kept) {
-  for (auto& [name, n] : removed) std::printf("  -%llu %s\n", n, name.c_str());
-  if (kept) std::printf("  %d stacks with item data left in place\n", kept);
-}
-
-// Empty the open chest (one) or every chest of its block (all) in one game stop: everything, or
-// only what the selector names (items, #ids, slots; with `all` the same slots in every chest).
-void chestClear(bool all, const std::vector<std::string>& words) {
-  auto sel = parseSelector(words);
-  if (!sel) return;
-  Block b;
-  if (all) b = openBlock();
-  else if (setPick(openChest()), pick.inv) b = {{pick.inv}, {}};
-  else std::puts("No chest, wagon or car window open.");
-  if (b.invs.empty()) return;
-  warnSlots(sel->slots, b.invs);
-  std::map<std::string, u64> removed;
-  int kept = 0;
-  if (editInventories(b.invs, [&](size_t i) { clearStacks(b.invs[i], *sel, removed, kept); }, [] {}, b.labels) < 0) return;
-  printRemoved(removed, kept);
-  if (removed.empty()) std::puts("  nothing to remove");
-}
-
-// Chests picked one by one (`chest add`), wherever they are; re-checked before every use.
-std::vector<Pick> chestList;
-std::vector<std::string> chestLabels;
-
-void chestAdd() {
-  u64 ent = openEntity(), inv = mainInventory(ent);
-  if (!inv) { std::puts("No chest, wagon or car window open."); return; }
-  for (auto& p : chestList) if (p.inv == inv) { std::puts("Already in the list."); return; }
-  chestList.push_back(pickOf(inv));
-  chestLabels.push_back(entityLabel(ent));
-  std::printf("Added %s (%zu in the list).\n", chestLabels.back().c_str(), chestList.size());
-}
-
-void chestShowList() {
-  if (chestList.empty()) std::puts("The list is empty: open a chest, `chest add`; repeat.");
-  for (size_t k = 0; k < chestList.size(); ++k)
-    std::printf("  %zu  %s%s\n", k + 1, chestLabels[k].c_str(), stillThere(chestList[k]) ? "" : "  (gone)");
-}
-
-// Split `total` over chests with room `cap`: smallest room first, each takes what fits of an even
-// share and the rest share the remainder. Empty when it does not all fit.
-constexpr std::vector<u64> shares(const std::vector<u64>& cap, u64 total) {
-  std::vector<size_t> order(cap.size());
-  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-  std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return cap[x] < cap[y]; });
-  std::vector<u64> out(cap.size());
-  for (size_t k = 0; k < order.size(); ++k) {
-    size_t i = order[k];
-    out[i] = std::min(cap[i], (total + order.size() - k - 1) / (order.size() - k));
-    total -= out[i];
-  }
-  return total ? std::vector<u64>{} : out;
-}
-static_assert(shares({100, 100, 100}, 10) == std::vector<u64>{4, 3, 3});
-static_assert(shares({2, 100, 100}, 10) == std::vector<u64>{2, 4, 4});
-static_assert(shares({1, 1}, 3).empty());
-
-// Even out one item over the listed chests (or the open chest's block) in one game stop: every
-// simple normal-quality stack of it is taken out and the total put back in equal shares. A chest
-// with less room (bar, filters, other items) gets what fits and the others share the rest, so
-// nothing is created or lost. Other qualities and stacks with item data stay where they are.
-void chestBalance(bool all, const std::string& name) {
-  Block b;
-  if (all) b = openBlock();
-  else
-    for (size_t k = 0; k < chestList.size(); ++k)
-      if (stillThere(chestList[k])) { b.invs.push_back(chestList[k].inv); b.labels.push_back(chestLabels[k]); }
-      else std::printf("%s: gone - skipped (`chest reset` and add it again).\n", chestLabels[k].c_str());
-  if (b.invs.size() < 2) {
-    std::puts(all ? "Nothing to balance: the block has one chest." : "Add at least two chests: open one, `chest add`; repeat.");
-    return;
-  }
-  u32 id = name.empty() ? firstItem(b.invs[0]) : itemId(name);
-  if (!id) { if (name.empty()) std::puts("The first chest is empty - name an item: chest balance <item>."); return; }
-  size_t n = b.invs.size();
-  std::vector<Placement> pls(n);
-  for (size_t k = 0; k < n; ++k) if (!canGive(b.invs[k], id, pls[k])) return;  // says why
-  u32 stack = items[id].stack;
-  auto movable = [&](u64 a) {
-    return rd<u16>(a + L.stackId).value_or(0) == id && !ptr(a + L.stackItem) && rd<u8>(a + L.stackQuality).value_or(0) == pls[0].normal;
-  };
-  std::vector<u64> had(n), target(n), placed(n);
-  u64 total = 0;
-  bool planned = false;
-  auto plan = [&](const std::vector<size_t>& ok) {
-    std::vector<u64> cap(n);
-    for (size_t i : ok) {
-      u64 arr = ptr(b.invs[i] + L.invData);
-      u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
-      for (u32 s = 0; s < size; ++s) {
-        u64 a = arr + s * L.stackSize;
-        bool mine = movable(a);
-        if (mine) had[i] += rd<u32>(a + L.stackCount).value_or(0);
-        if (s < pls[i].limit && (mine || (rd<u64>(a).value_or(1) == 0 && !ptr(a + L.stackItem))) && pls[i].accepts(s, id)) cap[i] += stack;
-      }
-      total += had[i];
-    }
-    std::vector<u64> okCap;
-    for (size_t i : ok) okCap.push_back(cap[i]);
-    auto split = shares(okCap, total);
-    for (size_t k = 0; k < split.size(); ++k) target[ok[k]] = split[k];
-    planned = ok.size() >= 2 && !split.empty();
-  };
-  int edited = editInventories(b.invs, [&](size_t i) {
-    if (!planned) return;
-    u64 arr = ptr(b.invs[i] + L.invData);
-    u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
-    for (u32 s = 0; s < size; ++s) if (movable(arr + s * L.stackSize)) wr<u64>(arr + s * L.stackSize, 0);
-    placed[i] = placeItems(b.invs[i], pls[i], id, target[i]);
-  }, [] {}, b.labels, plan);
-  if (edited < 0) return;
-  const char* item = items[id].name.c_str();
-  if (!planned) { std::printf("Refused: %llu %s do not fit back in (items beyond a bar?) - nothing changed.\n", total, item); return; }
-  std::printf("Balanced %llu %s over %d chests:\n", total, item, edited);
-  u64 lost = 0;
-  for (size_t i = 0; i < n; ++i) {
-    if (!had[i] && !target[i]) continue;
-    std::printf("  %-40s %8llu -> %llu\n", b.labels[i].c_str(), had[i], placed[i]);
-    lost += target[i] - placed[i];
-  }
-  if (lost) std::printf("WARNING: %llu %s could not be placed back.\n", lost, item);
 }
 
 // Empty the open train in one game stop: without names every simple stack of every cargo wagon and
