@@ -1645,6 +1645,11 @@ int main(int argc, char** argv) {
       else if (all) chestFillAll(names.empty() ? "" : names[0]);
       else chestFill(names.empty() ? "" : names[0]);
     }
+    else if (cmd == "train" && (arg == "fill" || arg == "clear")) {
+      std::vector<std::string> names;
+      for (std::string n; rest >> n;) names.push_back(n);
+      arg == "fill" ? trainFill(names) : trainClear(names);
+    }
     else if (cmd == "chest") invChest();
     else if (cmd == "set") { u32 s, c; std::istringstream a(line.substr(3)); if (a >> s >> c) invSet(s, c); else std::puts("Usage: set <slot> <count>"); }
     else if (cmd == "topup") { u64 inv = picked(); int n = inv ? invTopUp(inv) : -1; if (n >= 0) std::printf("Topped up %d stacks.\n", n); }
