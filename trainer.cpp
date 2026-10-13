@@ -409,17 +409,21 @@ template <class F> bool trap(u64 addr, const char* hint, DWORD timeoutMs, F onHi
   DebugSetProcessKillOnExit(FALSE);
   if (hint) std::printf("Armed - %s (%lus)\n", hint, timeoutMs / 1000);
 
-  bool result = false, armed = false;
+  bool result = false, armed = false, cleanup = false;  // cleanup: never arm, never call onHit
   auto handle = [&](DEBUG_EVENT& e) -> DWORD {
     switch (e.dwDebugEventCode) {
       case CREATE_PROCESS_DEBUG_EVENT: if (e.u.CreateProcessInfo.hFile) CloseHandle(e.u.CreateProcessInfo.hFile); break;
       case LOAD_DLL_DEBUG_EVENT: if (e.u.LoadDll.hFile) CloseHandle(e.u.LoadDll.hFile); break;
-      case CREATE_THREAD_DEBUG_EVENT: if (armed && !result) setDr(e.dwThreadId, addr); break;
+      case CREATE_THREAD_DEBUG_EVENT: if (armed && !result && !cleanup) setDr(e.dwThreadId, addr); break;
       case EXCEPTION_DEBUG_EVENT: {
         auto& er = e.u.Exception.ExceptionRecord;
-        if (er.ExceptionCode == EXCEPTION_BREAKPOINT && !armed) { setDrAll(addr); armed = true; return DBG_CONTINUE; }
+        if (er.ExceptionCode == EXCEPTION_BREAKPOINT && !armed) {
+          if (!cleanup) setDrAll(addr);
+          armed = true;
+          return DBG_CONTINUE;
+        }
         if (er.ExceptionCode == EXCEPTION_SINGLE_STEP && (u64)er.ExceptionAddress == addr) {
-          if (!result) {
+          if (!result && !cleanup) {
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, e.dwThreadId);
             CONTEXT c{};
             c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
@@ -446,9 +450,13 @@ template <class F> bool trap(u64 addr, const char* hint, DWORD timeoutMs, F onHi
     ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, st);
     if (ev.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) return false;
   }
+  // Clear, drain what is already queued without arming a new thread (a timeout can meet a thread
+  // being created), clear again, detach. A thread left armed after detach would crash the game.
+  cleanup = true;
   setDrAll(0);
-  for (int i = 0; i < 5 && WaitForDebugEvent(&ev, 50); ++i)  // drain anything already queued
+  for (int i = 0; i < 5 && WaitForDebugEvent(&ev, 50); ++i)
     ContinueDebugEvent(ev.dwProcessId, ev.dwThreadId, handle(ev));
+  setDrAll(0);
   DebugActiveProcessStop(g.pid);
   if (!result && hint) std::puts("Timed out - nothing captured.");
   return result;
@@ -465,17 +473,24 @@ struct GameCall { u64 fn, a1, a2; };
 
 // Runs frozen() while the whole game is stopped at the entry of
 // Controller::checkSortInventoryAfterUpdate (end of tick, update thread, where the game sorts
-// inventories itself), so no robot, inserter or checker can see a half-done edit. frozen() returns
-// the calls the update thread must make next; the stub that makes them is written while the game is
-// still stopped, so only what was really edited gets called. The thread is detoured through it:
-// each call fn(a1, a2) in order, then a done flag, then a jump back. At a function entry only RCX
-// (its one argument) is live; RDX is kept as well. False when no tick came (game paused) - then
-// nothing ran.
-template <class F> bool atEndOfTick(F frozen) {
-  constexpr u64 SIZE = 0x10000;  // 30 bytes per call: room for ~2000
-  u64 mem = (u64)VirtualAllocEx(g.proc, nullptr, SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-  if (!mem) return false;
-  u64 flag = mem + SIZE - 8;
+// inventories itself), so no robot, inserter, miner or checker can see a half-done edit. frozen()
+// returns the calls the update thread must make next (at most maxCalls); the stub that makes them is
+// written while the game is still stopped, so only what was really edited gets called. The thread is
+// detoured through it: each call fn(a1, a2) in order, then a done flag, then a jump back. At a
+// function entry only RCX (its one argument) is live; RDX is kept as well. False when no tick came
+// (game paused) - then nothing ran.
+//
+// The stub is allocated before the game stops, sized for maxCalls, so a re-sync can never fail to fit
+// after the edits are made. It is freed at the next edit, not when its flag is seen: the flag is
+// set two instructions before the stub's last jump.
+u64 stubToFree = 0;
+
+template <class F> bool atEndOfTick(F frozen, size_t maxCalls = 0) {
+  if (stubToFree) { VirtualFreeEx(g.proc, (LPVOID)stubToFree, 0, MEM_RELEASE); stubToFree = 0; }
+  u64 size = 64 + 32 * (u64)maxCalls;  // 37 bytes of frame and exit, 32 per call; flag at the start
+  u64 mem = maxCalls ? (u64)VirtualAllocEx(g.proc, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) : 0;
+  if (maxCalls && !mem) { std::puts("Could not allocate the re-sync stub - nothing changed."); return false; }
+  u64 flag = mem, code0 = mem + 16;
   bool detoured = false;
   bool hit = trap(L.sSortHook, nullptr, 3000, [&](CONTEXT& c) {
     cache.on = true;
@@ -498,25 +513,26 @@ template <class F> bool atEndOfTick(F frozen) {
     b({0x48, 0xB8}); imm(L.sSortHook);        // mov rax, hook
     b({0xFF, 0xE0});                          // jmp rax
     SIZE_T n = 0;
-    if (code.size() > SIZE - 8 || !WriteProcessMemory(g.proc, (LPVOID)mem, code.data(), code.size(), &n) || n != code.size()) {
+    if (calls.size() > maxCalls || code0 + code.size() > mem + size ||
+        !WriteProcessMemory(g.proc, (LPVOID)code0, code.data(), code.size(), &n) || n != code.size()) {
       std::puts("Warning: could not write the re-sync stub - network counts and chest icons may be stale.");
       return false;
     }
-    FlushInstructionCache(g.proc, (LPCVOID)mem, code.size());
-    c.Rip = mem;
+    FlushInstructionCache(g.proc, (LPCVOID)code0, code.size());
+    c.Rip = code0;
     return detoured = true;
   });
   if (!detoured) {
-    VirtualFreeEx(g.proc, (LPVOID)mem, 0, MEM_RELEASE);  // never entered
+    if (mem) VirtualFreeEx(g.proc, (LPVOID)mem, 0, MEM_RELEASE);  // never entered
     return hit;
   }
   for (int i = 0; i < 200; ++i, Sleep(10))
     if (rd<uint8_t>(flag).value_or(0)) {
-      VirtualFreeEx(g.proc, (LPVOID)mem, 0, MEM_RELEASE);
+      stubToFree = mem;
       return true;
     }
   std::puts("Warning: the game's re-sync call did not report back - network counts and chest icon may be stale.");
-  return true;  // ponytail: stub left allocated (64 KB); it may still be running
+  return true;  // ponytail: stub left allocated; it may still be running
 }
 
 // ---------------------------------------------------------------- names
@@ -766,6 +782,8 @@ int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const
   enum Why { OK, GONE, LIMITS };
   std::vector<Why> why(invs.size(), OK);
   int edited = 0;
+  size_t maxCalls = 0;
+  for (size_t i = 0; i < invs.size(); ++i) maxCalls += (fns[i] ? 1 : 0) + wakeLists[i].size();
   bool ran = atEndOfTick([&] {
     std::vector<GameCall> calls;
     std::vector<size_t> ok;
@@ -788,7 +806,7 @@ int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const
     }
     extra();
     return calls;
-  });
+  }, maxCalls);
   if (!ran) { std::puts("Nothing changed: the game ran no tick (paused?) or the debugger could not attach."); return -1; }
   for (size_t i = 0; i < invs.size(); ++i) {
     std::string who = i < labels.size() ? labels[i] + ": " : "";
