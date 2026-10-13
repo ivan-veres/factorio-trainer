@@ -4,7 +4,8 @@
   <a href="https://github.com/ivan-veres/factorio-trainer/releases/latest">Download</a> •
   <a href="#use">Usage</a> •
   <a href="#build">Build</a> •
-  <a href="#how-it-works">How it works</a>
+  <a href="#how-it-works">How it works</a> •
+  <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center"><b>Standalone memory trainer for Factorio 2.1.14 · single player · every offset looked up by name in factorio.pdb</b></p>
