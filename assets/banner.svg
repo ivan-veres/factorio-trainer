@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="200" viewBox="0 0 760 200">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2b2a28"/>
+      <stop offset="1" stop-color="#161615"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f6b45a"/>
+      <stop offset="0.55" stop-color="#e39827"/>
+      <stop offset="1" stop-color="#a8631a"/>
+    </linearGradient>
+    <g id="tooth"><rect x="-11" y="-74" width="22" height="26" rx="3"/></g>
+  </defs>
+  <rect width="760" height="200" rx="14" fill="url(#bg)"/>
+  <rect x="1.5" y="1.5" width="757" height="197" rx="13" fill="none" stroke="#3d3b37" stroke-width="3"/>
+  <!-- gear -->
+  <g transform="translate(112 100)" fill="url(#metal)">
+    <use href="#tooth"/>
+    <use href="#tooth" transform="rotate(45)"/>
+    <use href="#tooth" transform="rotate(90)"/>
+    <use href="#tooth" transform="rotate(135)"/>
+    <use href="#tooth" transform="rotate(180)"/>
+    <use href="#tooth" transform="rotate(225)"/>
+    <use href="#tooth" transform="rotate(270)"/>
+    <use href="#tooth" transform="rotate(315)"/>
+    <circle r="54"/>
+    <circle r="24" fill="#1d1c1a"/>
+    <circle r="54" fill="none" stroke="#7a4813" stroke-width="2"/>
+  </g>
+  <!-- belt stripe -->
+  <g transform="translate(206 150)">
+    <rect width="510" height="14" rx="3" fill="#3a3936"/>
+    <path d="M8 2h18l8 5-8 5H8l8-5zM58 2h18l8 5-8 5H58l8-5zM108 2h18l8 5-8 5h-18l8-5zM158 2h18l8 5-8 5h-18l8-5zM208 2h18l8 5-8 5h-18l8-5zM258 2h18l8 5-8 5h-18l8-5zM308 2h18l8 5-8 5h-18l8-5zM358 2h18l8 5-8 5h-18l8-5zM408 2h18l8 5-8 5h-18l8-5zM458 2h18l8 5-8 5h-18l8-5z" fill="#e3b33c"/>
+  </g>
+  <text x="206" y="98" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="60" font-weight="800" letter-spacing="1" fill="url(#metal)">FACTORIO</text>
+  <text x="208" y="134" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" font-size="30" font-weight="600" letter-spacing="9" fill="#e8e3d8">MEMORY TRAINER</text>
+</svg>

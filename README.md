@@ -1,4 +1,21 @@
-# Factorio trainer
+<p align="center"><img src="assets/banner.svg" alt="Factorio memory trainer" width="760"></p>
+
+<p align="center">
+  <a href="https://github.com/ivan-veres/factorio-trainer/releases/latest">Download</a> •
+  <a href="#use">Usage</a> •
+  <a href="#build">Build</a> •
+  <a href="#how-it-works">How it works</a>
+</p>
+
+<p align="center"><b>Standalone memory trainer for Factorio 2.1.14 · single player · every offset looked up by name in factorio.pdb</b></p>
+
+<p align="center">
+  <a href="https://github.com/ivan-veres/factorio-trainer/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/ivan-veres/factorio-trainer?logo=github&label=release&color=e39827"></a>
+  <a href="https://github.com/ivan-veres/factorio-trainer/actions/workflows/build.yml"><img alt="build" src="https://img.shields.io/github/actions/workflow/status/ivan-veres/factorio-trainer/build.yml?branch=main&label=build%20%28%2FW4%20%2FWX%29"></a>
+  <img alt="Factorio 2.1.14" src="https://img.shields.io/badge/Factorio-2.1.14-e39827">
+  <img alt="Windows" src="https://img.shields.io/badge/platform-Windows-0078d4">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/ivan-veres/factorio-trainer"></a>
+</p>
 
 A standalone Windows console trainer for **Factorio 2.1.14** (tested with Space Exploration 0.7.61),
 single player only. It replaces a Cheat Engine table (referred to below as "the CT") so that items,
@@ -8,7 +25,7 @@ disables achievements).
 ## Use
 
 1. Start Factorio, load the save (back it up first).
-2. Run `factorio-trainer.exe` (`--window` moves its console to `x y width height` read from
+2. Run `factorio-trainer.exe` ([Releases](https://github.com/ivan-veres/factorio-trainer/releases/latest), or [build](#build) it; `--window` moves its console to `x y width height` read from
    `trainer-window.txt` next to the exe). It attaches to `factorio.exe`, reads `factorio.pdb`, loads item and
    fluid names from the game and registers the hotkeys.
 

@@ -1,0 +1,39 @@
+# Builds both tools with MSVC at /W4, warnings as errors. A v* tag also publishes a GitHub release
+# with the two exes attached.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VS=%%i
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+          cl /nologo /std:c++20 /O2 /EHsc /W4 /WX /utf-8 trainer.cpp /Fe:factorio-trainer.exe dbghelp.lib user32.lib || exit /b 1
+          cl /nologo /std:c++20 /O2 /EHsc /W4 /WX /utf-8 pdbq.cpp /Fe:pdbq.exe dbghelp.lib || exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: factorio-trainer
+          path: |
+            factorio-trainer.exe
+            pdbq.exe
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create ${{ github.ref_name }} factorio-trainer.exe pdbq.exe --title ${{ github.ref_name }} --generate-notes
