@@ -237,7 +237,7 @@ struct Layout {
   u64 protoName, itemFlags, itemStackSize;
   u64 fluId, fluTemp, fluAmt, fluVol, fluFilterId, fluFilterMin, fluFilterMax, fluFilterCount, fluBoxesBegin, fluBoxesEnd;
   u64 boxSegment, boxConnBegin, boxConnEnd, connTarget, connOpposite, connFlags, connType, connSize, fpDefaultTemp, fpMaxTemp;
-  u64 entProto, entPost, entX, entY, oreAmt, resNormal;
+  u64 entProto, entPost, entX, entY, oreAmt, resNormal, resInfinite;
   u64 entSurface, surfChunks, chunkPos, chunkAdvTiles, chunkAdvTilesSize, advTileSize;
   u64 protoTileSize, entConnector, connTile, connNextOnTile, connEntity, tileEntities, rsFront, rsBack, rsTrain, fwFluid, fwCapacity, trainManager, managerMap, mapTick, trainActivity, fluidId, fluidTemp, fluidAmt;
 } L;
@@ -333,6 +333,7 @@ bool loadLayout() {
   L.entY = off("Entity", "position.y");
   L.oreAmt = off("ResourceEntity", "resourceAmount");
   L.resNormal = off("ResourceEntityPrototype", "normalAmount");  // 100% yield of an infinite resource
+  L.resInfinite = off("ResourceEntityPrototype", "infiniteType");  // oil-like; solid ores have a normalAmount too
 
   L.protoTileSize = off("EntityPrototype", "tileGridSizeStored");  // TilePosition {x, y}, tiles
   L.entConnector = off("Entity", "connector");  // link into the entity list of the tile it stands on
@@ -1463,6 +1464,11 @@ bool entityLive(u64 ent) {
   return false;
 }
 
+// 100% yield of an infinite (oil-like) resource; 0 for solid ores.
+u32 yieldBase(u64 proto) {
+  return rd<u8>(proto + L.resInfinite).value_or(0) ? rd<u32>(proto + L.resNormal).value_or(0) : 0;
+}
+
 bool oreLive(u64 a) { return ptr(a) == ore.vt1 && ptr(a + L.entProto) == ore.proto && entityLive(a); }
 
 // Every tile of the anchor's resource type within `ore.reach` tiles of the patch (flood fill by map position).
@@ -1470,7 +1476,7 @@ bool oreLive(u64 a) { return ptr(a) == ore.vt1 && ptr(a + L.entProto) == ore.pro
 // field reach.
 bool orePopulate(bool quiet = false) {
   ore.vt1 = ptr(ore.anchor); ore.vt2 = ptr(ore.anchor + L.entPost); ore.proto = ptr(ore.anchor + L.entProto);
-  u32 normal = rd<u32>(ore.proto + L.resNormal).value_or(0);
+  u32 normal = yieldBase(ore.proto);
   ore.reach = normal ? OIL_REACH : 1;
   ore.tiles.clear();
   if (!ore.vt1 || !ore.vt2 || !ore.proto) { std::puts("Captured address is not an entity - capture again."); return false; }
@@ -1511,7 +1517,7 @@ void oreSet(u32 value) {
 void oilSet(double tgt) {
   if (!ore.anchor || ptr(ore.anchor) != ore.vt1) { std::puts("Capture one well with `ore` first."); return; }
   if (tgt <= 0) { std::puts("Usage: oil <target %>"); return; }
-  u32 normal = rd<u32>(ore.proto + L.resNormal).value_or(0);
+  u32 normal = yieldBase(ore.proto);
   if (!normal) { std::puts("That resource has no yield baseline (not an oil-like resource)."); return; }
   if (!orePopulate(true)) return;
   oreSet((u32)std::max(1.0, std::floor(tgt / 100.0 * normal + 0.5)));
