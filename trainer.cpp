@@ -665,7 +665,7 @@ void invList() {
     if (ptr(a + L.stackItem)) note = "[item data - not editable]";
     else if (it != items.end() && it->second.unstackable) note = "[unstackable]";
     else if (it != items.end()) note = "[max " + std::to_string(it->second.stack) + "]";
-    std::printf("  %3u  %-40s %8u  %s\n", i, name.c_str(), cnt, note.c_str());
+    std::printf("  %3u  %-40s id %-5u %8u  %s\n", i, name.c_str(), id, cnt, note.c_str());
   }
 }
 
@@ -945,7 +945,7 @@ void clearItem(const std::string& name) {
   u64 removed = 0;
   int kept = 0;
   if (!editInventory(inv, [&] { removed = removeItems(inv, id, &kept); })) return;
-  std::printf("Removed %llu %s%s.\n", removed, name.c_str(), kept ? " (stacks with item data left in place)" : "");
+  std::printf("Removed %llu %s%s.\n", removed, items[id].name.c_str(), kept ? " (stacks with item data left in place)" : "");
 }
 
 constexpr u64 FILL = ~0ull;  // give(): as many as fit
@@ -958,8 +958,8 @@ void give(const std::string& name, u64 want) {
   if (!id || !canGive(inv, id, pl)) return;
   u64 put = 0;
   if (!editInventory(inv, [&] { put = placeItems(inv, pl, id, want); })) return;
-  if (want == FILL) std::printf("Filled with %llu %s.\n", put, name.c_str());
-  else std::printf("Gave %llu %s%s.\n", put, name.c_str(), put < want ? " (inventory full)" : "");
+  if (want == FILL) std::printf("Filled with %llu %s.\n", put, items[id].name.c_str());
+  else std::printf("Gave %llu %s%s.\n", put, items[id].name.c_str(), put < want ? " (inventory full)" : "");
 }
 
 // Replace every simple stack of `from` with the same number of `to`, in one edit, and only when
@@ -986,9 +986,10 @@ void swapItems(const std::string& from, const std::string& to) {
     done = true;
   });
   if (!ok) return;
-  if (!have) std::printf("No %s here.\n", from.c_str());
-  else if (!done) std::printf("Refused: %llu %s do not fit as %s here (room for %llu).\n", have, from.c_str(), to.c_str(), fits);
-  else std::printf("Swapped %llu %s for %llu %s.\n", have, from.c_str(), put, to.c_str());
+  const char *f = items[fid].name.c_str(), *t = items[tid].name.c_str();  // names, also when ids were typed
+  if (!have) std::printf("No %s here.\n", f);
+  else if (!done) std::printf("Refused: %llu %s do not fit as %s here (room for %llu).\n", have, f, t, fits);
+  else std::printf("Swapped %llu %s for %llu %s.\n", have, f, put, t);
 }
 
 u16 firstItem(u64 inv) {
