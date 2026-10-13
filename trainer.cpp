@@ -84,6 +84,7 @@ template <class T> bool wr(u64 a, T v) {
   SIZE_T n = 0;
   if (!WriteProcessMemory(g.proc, (LPVOID)a, &v, sizeof v, &n) || n != sizeof v) return false;
   if (auto c = cached(a, sizeof v)) std::memcpy(const_cast<uint8_t*>(c), &v, sizeof v);
+  else if (cache.on) for (u64 p : {a & ~0xFFFull, (a + sizeof v - 1) & ~0xFFFull}) cache.pages.erase(p);  // crosses a page
   return true;
 }
 
@@ -535,6 +536,14 @@ template <class F> bool atEndOfTick(F frozen, size_t maxCalls = 0) {
   return true;  // ponytail: stub left allocated; it may still be running
 }
 
+// f() with the game stopped at the end of a tick, for writes that need no re-sync call (fluids, ore);
+// false when no tick came (paused) - then nothing ran.
+template <class F> bool frozenDo(F f) {
+  return atEndOfTick([&] { f(); return std::vector<GameCall>{}; });
+}
+
+const char* NO_TICK = "Nothing changed: the game ran no tick (paused?) or the debugger could not attach.";
+
 // ---------------------------------------------------------------- names
 std::optional<std::string> readStdString(u64 base) {  // MSVC std::string
   auto len = rd<u64>(base + 0x10), cap = rd<u64>(base + 0x18);
@@ -762,10 +771,11 @@ u16 lastNonEmpty(u64 inv) {
 template <class F, class X = void (*)(), class P = void (*)(const std::vector<size_t>&)>
 int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const std::vector<std::string>& labels = {},
                     P plan = [](const std::vector<size_t>&) {}) {
-  std::vector<u64> owners, fns;
+  std::vector<u64> owners, fns, invVts, ownerVts;  // identity, re-checked inside the stop
   std::vector<std::vector<u64>> wakeLists(invs.size());
   for (size_t i = 0; i < invs.size(); ++i) {
     u64 owner = ptr(invs[i] + L.invOwner), fn = owner ? ptr(ptr(owner) + 0x18) : 0;
+    invVts.push_back(ptr(invs[i])); ownerVts.push_back(owner ? ptr(owner) : 0);
     if (fn && !pdb::nameAt(fn).ends_with("::inventorySorted")) {
       std::puts("Refused: the owner's vtable changed shape (inventorySorted not at slot 0x18) - re-check after a game update.");
       return 0;
@@ -789,7 +799,8 @@ int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const
     std::vector<size_t> ok;
     for (size_t i = 0; i < invs.size(); ++i) {
       u64 inv = invs[i];
-      if (!looksLikeInventory(inv) || ptr(inv + L.invOwner) != owners[i]) { why[i] = GONE; continue; }
+      if (!looksLikeInventory(inv) || ptr(inv) != invVts[i] || ptr(inv + L.invOwner) != owners[i] ||
+          (owners[i] && ptr(owners[i]) != ownerVts[i])) { why[i] = GONE; continue; }
       if (firstNonFull(inv) != rd<u16>(inv + L.invFirstNonFull).value_or(0xFFFF) ||
           lastNonEmpty(inv) != rd<u16>(inv + L.invLastNonEmpty).value_or(0xFFFF)) { why[i] = LIMITS; continue; }
       ok.push_back(i);
@@ -807,7 +818,7 @@ int editInventories(const std::vector<u64>& invs, F edit, X extra = [] {}, const
     extra();
     return calls;
   }, maxCalls);
-  if (!ran) { std::puts("Nothing changed: the game ran no tick (paused?) or the debugger could not attach."); return -1; }
+  if (!ran) { std::puts(NO_TICK); return -1; }
   for (size_t i = 0; i < invs.size(); ++i) {
     std::string who = i < labels.size() ? labels[i] + ": " : "";
     if (why[i] == GONE) std::printf("%sNothing changed: the inventory is gone - pick it again.\n", who.c_str());
@@ -823,20 +834,25 @@ template <class F> bool editInventory(u64 inv, F edit) {
 void invSet(u32 slot, u32 count) {
   u64 inv = picked();
   if (!inv) return;
-  u16 total = *rd<u16>(inv + L.invSize);
-  if (slot >= total) { std::printf("Slot %u out of range (0..%u).\n", slot, total - 1u); return; }
-  u64 a = ptr(inv + L.invData) + slot * L.stackSize;
-  auto it = items.find(rd<u16>(a + L.stackId).value_or(0));
-  // Inventory::canInsertCount adds stackSize - count as unsigned 32-bit: an overstacked slot wraps
-  // it and the game promises room that is not there. Only your own inventory, where a ctrl+click
-  // transfer splits the stack again.
-  if (it != items.end() && count > it->second.stack && inv != myInventory()) {
-    std::printf("Refused: more than a stack (%u) only in your own inventory (`inv`).\n", it->second.stack);
-    return;
-  }
-  const char* why = nullptr;
-  if (!editInventory(inv, [&] { why = writeStack(a, count); })) return;
-  if (why) std::printf("Refused: %s.\n", why); else std::printf("Slot %u = %u\n", slot, count);
+  bool mine = inv == myInventory();
+  std::string why;
+  // Slot, item and stack size are read inside the game stop: the inventory can be reallocated
+  // (armor, research) or the slot refilled by an inserter during the tick the trainer waits for.
+  if (!editInventory(inv, [&] {
+        u16 total = rd<u16>(inv + L.invSize).value_or(0);
+        if (slot >= total) { why = "slot " + std::to_string(slot) + " out of range (0.." + std::to_string(total - 1) + ")"; return; }
+        u64 a = ptr(inv + L.invData) + slot * L.stackSize;
+        auto it = items.find(rd<u16>(a + L.stackId).value_or(0));
+        // Inventory::canInsertCount adds stackSize - count as unsigned 32-bit: an overstacked slot
+        // wraps it and the game promises room that is not there. Only your own inventory, where a
+        // ctrl+click transfer splits the stack again.
+        if (it != items.end() && count > it->second.stack && !mine) {
+          why = "more than a stack (" + std::to_string(it->second.stack) + ") only in your own inventory (`inv`)";
+          return;
+        }
+        if (const char* w = writeStack(a, count)) why = w;
+      })) return;
+  if (!why.empty()) std::printf("Refused: %s.\n", why.c_str()); else std::printf("Slot %u = %u\n", slot, count);
 }
 
 // Top up every simple stack in the inventory to its stack size; -1 when refused.
@@ -960,6 +976,21 @@ struct Placement {
   }
 };
 
+// Slot count, bar and filters as they are now. canGive runs while the game runs; the placement
+// happens in a game stop a tick later, when the inventory may have been resized or its bar or filter
+// storage changed. An inventory of another type now gets no usable slot.
+Placement current(u64 inv, Placement pl) {
+  u64 vt = ptr(inv), filters = 0;
+  if (vt == L.vtInvFilters) filters = ptr(inv + L.filtersPlain);
+  else if (vt == L.vtInvFiltersBar) filters = ptr(inv + L.filtersBar);
+  else if (vt != L.vtInv && vt != L.vtInvBar) { pl.limit = 0; return pl; }
+  u16 total = rd<u16>(inv + L.invSize).value_or(0);
+  pl.limit = vt == L.vtInvBar || vt == L.vtInvFiltersBar ? std::min<u16>(total, rd<u16>(inv + L.invBar).value_or(0)) : total;
+  pl.nFilters = filters ? rd<u32>(filters + L.holderSize).value_or(0) : 0;
+  pl.fBegin = filters ? ptr(filters + L.holderBegin) : 0;
+  return pl;
+}
+
 bool canGive(u64 inv, u32 id, Placement& pl) {
   if (!plainItem(id) || items[id].unstackable || !items[id].stack) {
     std::puts("Refused: that item carries per-item data (ammo, armor, tools, spoilables, equipment).");
@@ -971,20 +1002,19 @@ bool canGive(u64 inv, u32 id, Placement& pl) {
     std::puts("ItemStack layout changed - give is disabled until it is re-checked.");
     return false;
   }
-  u64 vt = ptr(inv), filters = 0;
-  if (vt == L.vtInvFilters) filters = ptr(inv + L.filtersPlain);
-  else if (vt == L.vtInvFiltersBar) filters = ptr(inv + L.filtersBar);
-  else if (vt != L.vtInv && vt != L.vtInvBar) { std::puts("Refused: this inventory type has its own stack or weight limits."); return false; }
-  u16 total = *rd<u16>(inv + L.invSize);
-  pl.limit = vt == L.vtInvBar || vt == L.vtInvFiltersBar ? std::min<u16>(total, rd<u16>(inv + L.invBar).value_or(0)) : total;
-  pl.nFilters = filters ? rd<u32>(filters + L.holderSize).value_or(0) : 0;
-  pl.fBegin = filters ? ptr(filters + L.holderBegin) : 0;
+  u64 vt = ptr(inv);
+  if (vt != L.vtInv && vt != L.vtInvBar && vt != L.vtInvFilters && vt != L.vtInvFiltersBar) {
+    std::puts("Refused: this inventory type has its own stack or weight limits.");
+    return false;
+  }
+  pl = current(inv, pl);
   return true;
 }
 
 // Put up to `want` of a plain item: top up same-item normal stacks, then fill empty slots
 // (count, id, quality, cached stack size in one write). Never overstacks. Returns how many.
-u64 placeItems(u64 inv, const Placement& pl, u32 id, u64 want) {
+u64 placeItems(u64 inv, const Placement& given, u32 id, u64 want) {
+  Placement pl = current(inv, given);
   u32 stack = items[id].stack;
   u64 arr = ptr(inv + L.invData), left = want;
   for (u32 i = 0; i < pl.limit && left; ++i) {
@@ -1005,7 +1035,8 @@ u64 placeItems(u64 inv, const Placement& pl, u32 id, u64 want) {
 }
 
 // How many of `id` placeItems could put in once every simple stack of `freed` is removed.
-u64 room(u64 inv, const Placement& pl, u32 id, u32 freed) {
+u64 room(u64 inv, const Placement& given, u32 id, u32 freed) {
+  Placement pl = current(inv, given);
   u32 stack = items[id].stack;
   u64 arr = ptr(inv + L.invData), n = 0;
   for (u32 i = 0; i < pl.limit; ++i) {
@@ -1279,6 +1310,7 @@ void chestBalance(bool all, const std::string& name) {
   auto plan = [&](const std::vector<size_t>& ok) {
     std::vector<u64> cap(n);
     for (size_t i : ok) {
+      pls[i] = current(b.invs[i], pls[i]);
       u64 arr = ptr(b.invs[i] + L.invData);
       u16 size = rd<u16>(b.invs[i] + L.invSize).value_or(0);
       for (u32 s = 0; s < size; ++s) {
@@ -1368,6 +1400,12 @@ bool parseNames(const std::vector<std::string>& words, std::vector<u32>& itemIds
   return true;
 }
 
+// A rolling stock still the same object in the same train. Checked inside the game stop: a wagon
+// can be mined or uncoupled during the tick the trainer waits for.
+struct StockId { u64 ent, vt, train; };
+StockId stockId(u64 ent) { return {ent, ptr(ent), ptr(ent + L.rsTrain)}; }
+bool still(const StockId& s) { return s.vt && ptr(s.ent) == s.vt && ptr(s.ent + L.rsTrain) == s.train; }
+
 // The "inactivity" wait condition counts from Train.schedulable.tickOfLastActivity; the game
 // stamps it with Map.entityTick when a wagon's contents change (FluidWagon::setFluid).
 void stampActivity(u64 stock) {
@@ -1401,7 +1439,7 @@ void trainFill(const std::vector<std::string>& names) {
   std::vector<u32> ids;
   std::vector<Placement> pls;
   std::vector<std::string> labels;
-  struct FluidJob { u64 ent; u16 id; float temp; int64_t cap; int64_t added = 0; };
+  struct FluidJob { StockId sid; u16 id; float temp; int64_t cap; int64_t added = 0; };
   std::vector<FluidJob> jobs;
   int cargo = 0, fluidWagons = 0, emptyCargo = 0, emptyFluid = 0;
   for (size_t k = 0; k < stock.size(); ++k) {
@@ -1429,7 +1467,7 @@ void trainFill(const std::vector<std::string>& names) {
       u64 proto = ptr(ptr(L.sFluids) + id * 8);
       float temp = cur.id == id && cur.amount > 0 ? cur.temperature : rd<float>(proto + L.fpDefaultTemp).value_or(15);
       temp = std::min(temp, rd<float>(proto + L.fpMaxTemp).value_or(temp));
-      jobs.push_back({stock[k], id, temp, cap});
+      jobs.push_back({stockId(stock[k]), id, temp, cap});
     }
   }
   std::printf("Train: %zu vehicles, %d cargo wagons, %d fluid wagons.\n", stock.size(), cargo, fluidWagons);
@@ -1440,6 +1478,7 @@ void trainFill(const std::vector<std::string>& names) {
   }
 
   std::map<std::string, std::pair<u64, int>> put;  // item -> (count, wagons it went into)
+  StockId first = stockId(stock[0]);
   int full = 0;
   int edited = editInventories(invs, [&](size_t i) {
     u64 n = placeItems(invs[i], pls[i], ids[i], FILL);
@@ -1450,11 +1489,13 @@ void trainFill(const std::vector<std::string>& names) {
     bool changed = !put.empty();
     for (auto& j : jobs) {
       Fl cur{};
-      if (!rd(j.ent + L.fwFluid, cur) || (cur.id && cur.amount > 0 && cur.id != j.id) || cur.amount >= j.cap) continue;
+      if (!still(j.sid) || !rd(j.sid.ent + L.fwFluid, cur)) continue;
+      j.cap = rd<int64_t>(j.sid.ent + L.fwCapacity).value_or(0);
+      if ((cur.id && cur.amount > 0 && cur.id != j.id) || j.cap <= 0 || cur.amount >= j.cap) continue;
       Fl f{j.id, cur.pad, j.temp, j.cap};
-      if (wr(j.ent + L.fwFluid, f)) { j.added = j.cap - (cur.id == j.id ? cur.amount : 0); changed = true; }
+      if (wr(j.sid.ent + L.fwFluid, f)) { j.added = j.cap - (cur.id == j.id ? cur.amount : 0); changed = true; }
     }
-    if (changed) stampActivity(stock[0]);
+    if (changed && still(first)) stampActivity(first.ent);
   }, labels);
   if (edited < 0) return;
   for (auto& [name, e] : put) std::printf("  +%llu %s (%d wagons)\n", e.first, name.c_str(), e.second);
@@ -1484,7 +1525,8 @@ void trainClear(const std::vector<std::string>& names) {
   bool doCargo = names.empty() || !itemIds.empty() || !slots.empty(), doFluid = names.empty() || !fluidIds.empty();
   if (L.fluidTemp != L.fluidId + 4 || L.fluidAmt != L.fluidId + 8) { std::puts("Fluid layout changed - refused."); return; }
 
-  std::vector<u64> invs, tanks;
+  std::vector<u64> invs;
+  std::vector<StockId> tanks;
   std::vector<std::string> labels;
   int cargo = 0, fluidWagons = 0;
   for (size_t k = 0; k < stock.size(); ++k) {
@@ -1496,7 +1538,7 @@ void trainClear(const std::vector<std::string>& names) {
       else std::printf("%s: no inventory found - skipped.\n", label.c_str());
     } else if (cls == "FluidWagon") {
       ++fluidWagons;
-      if (doFluid) tanks.push_back(stock[k]);
+      if (doFluid) tanks.push_back(stockId(stock[k]));
     }
   }
   std::printf("Train: %zu vehicles, %d cargo wagons, %d fluid wagons.\n", stock.size(), cargo, fluidWagons);
@@ -1508,15 +1550,16 @@ void trainClear(const std::vector<std::string>& names) {
   std::map<std::string, double> drained;
   int kept = 0;
   Selector sel{itemIds, slots};
+  StockId first = stockId(stock[0]);
   int edited = editInventories(invs, [&](size_t i) { clearStacks(invs[i], sel, removed, kept); }, [&] {
     bool changed = !removed.empty();
-    for (u64 t : tanks) {
+    for (auto& t : tanks) {
       Fl cur{};
-      if (!rd(t + L.fwFluid, cur) || !cur.id || !wanted(fluidIds, cur.id)) continue;
+      if (!still(t) || !rd(t.ent + L.fwFluid, cur) || !cur.id || !wanted(fluidIds, cur.id)) continue;
       Fl none{0, cur.pad, 0.0f, 0};
-      if (wr(t + L.fwFluid, none)) { drained[fluids[cur.id]] += cur.amount / FLUID_SCALE; changed = true; }
+      if (wr(t.ent + L.fwFluid, none)) { drained[fluids[cur.id]] += cur.amount / FLUID_SCALE; changed = true; }
     }
-    if (changed) stampActivity(stock[0]);
+    if (changed && still(first)) stampActivity(first.ent);
   }, labels);
   if (edited < 0) return;
   printRemoved(removed, kept);
@@ -1549,7 +1592,11 @@ bool fluCapture() {
   return true;
 }
 
-bool fluTopUp() { return wr<int64_t>(fluSeg + L.fluAmt, *rd<int64_t>(fluSeg + L.fluVol)); }
+// Checked and written in one game stop: the segment can be freed or refilled while the game runs.
+bool fluTopUp() {
+  bool ok = false;
+  return frozenDo([&] { ok = looksLikeSegment(fluSeg) && wr<int64_t>(fluSeg + L.fluAmt, *rd<int64_t>(fluSeg + L.fluVol)); }) && ok;
+}
 
 // Fluid segment of the tank/pipe whose window is open: any entity class with a `fluidBox` member.
 u64 openFluidSegment(std::string* what = nullptr) {
@@ -1565,8 +1612,10 @@ u64 openFluidSegment(std::string* what = nullptr) {
 }
 
 // Put `name` into an empty fluid network (or top up one that already holds it), keeping
-// every invariant FluidSegment/FluidBuffer/FluidBox::checkConsistency assert on.
-void fillWith(const std::string& name) {
+// every invariant FluidSegment/FluidBuffer/FluidBox::checkConsistency assert on. Runs inside one
+// game stop (fillWith): the fluid system updates segments every tick, so the checks and the
+// 16-byte write must see the same state.
+void fillWithNow(const std::string& name) {
   std::string cls;
   u64 seg = openFluidSegment(&cls);
   if (!seg) { std::puts("Open the window of a storage tank or pipe first (no window, or that entity has no fluid box)."); return; }
@@ -1619,8 +1668,13 @@ void fillWith(const std::string& name) {
   fluShow();
 }
 
-// Flush the open tank/pipe network like the game's flush button: an empty buffer is fluid 0, temperature 0, amount 0.
-void emptyOpen() {
+void fillWith(const std::string& name) {
+  if (!frozenDo([&] { fillWithNow(name); })) std::puts(NO_TICK);
+}
+
+// Flush the open tank/pipe network like the game's flush button: an empty buffer is fluid 0,
+// temperature 0, amount 0. In one game stop, like fill.
+void emptyOpenNow() {
   std::string cls;
   u64 seg = openFluidSegment(&cls);
   if (!seg) { std::puts("Open the window of a storage tank or pipe first."); return; }
@@ -1628,6 +1682,10 @@ void emptyOpen() {
   if (L.fluTemp != L.fluId + 4 || L.fluAmt != L.fluId + 8 || !rd(seg + L.fluId, fluid)) { std::puts("Fluid layout changed - refused."); return; }
   fluid.id = 0; fluid.temperature = 0; fluid.amount = 0;
   std::puts(wr(seg + L.fluId, fluid) ? "Emptied." : "Write failed.");
+}
+
+void emptyOpen() {
+  if (!frozenDo(emptyOpenNow)) std::puts(NO_TICK);
 }
 
 // ---------------------------------------------------------------- ore
@@ -1743,9 +1801,11 @@ bool oreCapture(bool quiet = false) {
   return orePopulate(quiet);
 }
 
+// Every captured tile still linked into the map, checked and written in one game stop (a miner can
+// exhaust and free a tile between a check and a write while the game runs). -1: no tick came.
 int oreWrite(u32 value) {
   int n = 0;
-  for (u64 a : ore.tiles) if (oreLive(a) && wr<u32>(a + L.oreAmt, value)) ++n;
+  if (!frozenDo([&] { for (u64 a : ore.tiles) if (oreLive(a) && wr<u32>(a + L.oreAmt, value)) ++n; })) return -1;
   return n;
 }
 
@@ -1753,6 +1813,7 @@ void oreSet(u32 value) {
   if (ore.tiles.empty()) { std::puts("Capture first (`ore`)."); return; }
   if (value == 0) { std::puts("Refusing 0 - the game cannot clean up a zero tile written from outside. Use 1."); return; }
   int n = oreWrite(value);
+  if (n < 0) { std::puts(NO_TICK); return; }
   std::printf("Wrote %u into %d of %zu tiles. The map label updates after a re-chart or reload.\n", value, n, ore.tiles.size());
 }
 
