@@ -16,7 +16,7 @@ disables achievements).
 |---|---|
 | `inv` | your character's main inventory, no clicking |
 | `chest` | the chest, cargo wagon, car or spidertron whose window is open in game |
-| `chest fill [item]` | fill the open chest's free slots (up to its limit bar) with its first item, or the named one |
+| `chest fill [slots] [item]` | fill the open chest's free slots (up to its limit bar), or only slots `22` / `22-90`, with its first item or the named one (`chest fill 10-15 #123`); slots holding other items are left alone |
 | `chest clear [what]` | empty the open chest, or remove only what is named: items, item ids `#777`, slots `22` or ranges `22-90`, separated by spaces or commas (`chest clear stone,#777 5-20`) |
 | `chest fill all [item]` / `chest clear all [items]` | the same for every chest of that kind in its block, in one game stop |
 | `chest add` / `chest list` / `chest reset` | pick chests anywhere, one by one: open a chest's window, `chest add`; repeat |

@@ -916,6 +916,12 @@ struct Placement {
   u32 nFilters = 0;
   u64 fBegin = 0;
   u8 normal = 0;
+  std::vector<std::pair<u32, u32>> slots;  // only these slot ranges (chest fill 10-15); empty: all
+  bool inSlots(u32 i) const {
+    if (slots.empty()) return true;
+    for (auto [a, b] : slots) if (i >= a && i <= b) return true;
+    return false;
+  }
   bool accepts(u32 i, u32 id) const {
     if (i >= nFilters || !fBegin) return true;
     u16 f = rd<u16>(fBegin + i * L.filterSize + L.filterId).value_or(1);
@@ -953,13 +959,13 @@ u64 placeItems(u64 inv, const Placement& pl, u32 id, u64 want) {
   for (u32 i = 0; i < pl.limit && left; ++i) {
     u64 a = arr + i * L.stackSize;
     u32 cnt = rd<u32>(a + L.stackCount).value_or(0);
-    if (rd<u16>(a + L.stackId).value_or(0) != id || ptr(a + L.stackItem) || rd<u8>(a + L.stackQuality).value_or(0) != pl.normal || cnt >= stack) continue;
+    if (!pl.inSlots(i) || rd<u16>(a + L.stackId).value_or(0) != id || ptr(a + L.stackItem) || rd<u8>(a + L.stackQuality).value_or(0) != pl.normal || cnt >= stack) continue;
     u32 add = (u32)std::min<u64>(stack - cnt, left);
     if (wr<u32>(a + L.stackCount, cnt + add)) left -= add;
   }
   for (u32 i = 0; i < pl.limit && left; ++i) {
     u64 a = arr + i * L.stackSize;
-    if (rd<u64>(a).value_or(1) != 0 || ptr(a + L.stackItem) || !pl.accepts(i, id)) continue;
+    if (!pl.inSlots(i) || rd<u64>(a).value_or(1) != 0 || ptr(a + L.stackItem) || !pl.accepts(i, id)) continue;
     u32 put = (u32)std::min<u64>(stack, left);
     u64 packed = put | (u64)id << 32 | (u64)pl.normal << 48 | (u64)std::min<u32>(stack, 255) << 56;
     if (wr<u64>(a, packed)) left -= put;
@@ -1016,11 +1022,12 @@ void clearPicked(const std::vector<std::string>& words) {
 constexpr u64 FILL = ~0ull;  // give(): as many as fit
 
 // Spawn `want` of a plain item into the picked inventory as normal-quality stacks.
-void give(const std::string& name, u64 want) {
+void give(const std::string& name, u64 want, const std::vector<std::pair<u32, u32>>& slots = {}) {
   u64 inv = picked();
   u32 id = inv ? itemId(name) : 0;
   Placement pl;
   if (!id || !canGive(inv, id, pl)) return;
+  pl.slots = slots;
   u64 put = 0;
   if (!editInventory(inv, [&] { put = placeItems(inv, pl, id, want); })) return;
   if (want == FILL) std::printf("Filled with %llu %s.\n", put, items[id].name.c_str());
@@ -1066,12 +1073,12 @@ u16 firstItem(u64 inv) {
 
 // Fill every free slot (up to the bar) of the open chest with the named item, or the item in its
 // first occupied slot.
-bool chestFill(const std::string& name = "") {
+bool chestFill(const Selector& sel = {}) {
   setPick(openChest());
   if (!pick.inv) { std::puts("No chest, wagon or car window open."); return false; }
-  u32 id = name.empty() ? firstItem(pick.inv) : itemId(name);
-  if (!id) { if (name.empty()) std::puts("The chest is empty - name an item: chest fill <item>."); return false; }
-  give(items[id].name, FILL);
+  u32 id = sel.ids.empty() ? firstItem(pick.inv) : sel.ids[0];
+  if (!id) { if (sel.ids.empty()) std::puts("The chest is empty - name an item: chest fill <item>."); return false; }
+  give(items[id].name, FILL, sel.slots);
   return true;
 }
 
@@ -1761,7 +1768,7 @@ void restoreWindow() {
 const char* HELP = R"(Commands:
   inv                 your character's main inventory (no clicking)
   chest               the chest/wagon/car whose window is open in game (no clicking)
-  chest fill [item]   fill its free slots with the item in its first slot (or the named one)
+  chest fill [slots] [item]  fill its free slots (or only slots 22 / 22-90) with its first item or the named one
   chest clear [what]  empty it, or only what is named: items, #ids, slots 22 or 22-90 (spaces or commas)
   chest fill all [item] / chest clear all [items]  the same for every chest of that kind in its block
   chest add | list | reset   pick chests anywhere: open one, `chest add`; repeat
@@ -1827,9 +1834,11 @@ int main(int argc, char** argv) {
       if (all) names.erase(names.begin());
       if (arg == "clear") chestClear(all, names);
       else if (arg == "balance") names.size() > 1 ? (void)std::puts("Usage: chest balance [all] [item]") : chestBalance(all, names.empty() ? "" : names[0]);
-      else if (names.size() > 1) std::puts("Usage: chest fill [all] [item]");
-      else if (all) chestFillAll(names.empty() ? "" : names[0]);
-      else chestFill(names.empty() ? "" : names[0]);
+      else if (auto sel = parseSelector(names); !sel) {}
+      else if (sel->ids.size() > 1) std::puts("Usage: chest fill [all] [item] / chest fill <slots 22 or 22-90> [item] - one item.");
+      else if (all && !sel->slots.empty()) std::puts("Slot numbers need one chest: `chest fill <slots> [item]` without `all`.");
+      else if (all) chestFillAll(sel->ids.empty() ? "" : items[sel->ids[0]].name);
+      else chestFill(*sel);
     }
     else if (cmd == "train" && (arg == "fill" || arg == "clear")) {
       std::vector<std::string> names;
