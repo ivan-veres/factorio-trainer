@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -834,9 +835,18 @@ bool plainItem(u32 id) {
   return false;  // shouldCreateItem changed shape: refuse rather than guess
 }
 
+// A whole decimal number, or nothing.
+std::optional<u32> number(const std::string& s) {
+  u32 v = 0;
+  auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  return ec == std::errc{} && end == s.data() + s.size() ? std::optional(v) : std::nullopt;
+}
+
+// An item by internal name or by the id `find` shows.
 u32 itemId(const std::string& name) {
+  if (auto k = number(name); k && items.count(*k)) return *k;
   for (auto& [i, info] : items) if (info.name == name) return i;
-  std::printf("No item named '%s' (try `find`).\n", name.c_str());
+  std::printf("No item named or numbered '%s' (try `find`).\n", name.c_str());
   return 0;
 }
 
@@ -1088,7 +1098,7 @@ std::vector<u64> openTrain() {
 bool parseNames(const std::vector<std::string>& names, std::vector<u32>& itemIds, std::vector<u16>& fluidIds) {
   for (auto& n : names) {
     bool found = false;
-    for (auto& [i, info] : items) if (info.name == n) { itemIds.push_back(i); found = true; }
+    for (auto& [i, info] : items) if (info.name == n || number(n) == i) { itemIds.push_back(i); found = true; }  // a number is an item id
     for (auto& [i, f] : fluids) if (f == n) { fluidIds.push_back((u16)i); found = true; }
     if (!found) { std::printf("No item or fluid named '%s' (try `find`).\n", n.c_str()); return false; }
   }
@@ -1589,7 +1599,7 @@ const char* HELP = R"(Commands:
   give <item> <n>     add n of an item as normal stacks (e.g. give electronic-circuit 2000)
   clear <item>        remove every stack of an item from the listed inventory
   swap <from> <to>    replace all of one item with the same number of another
-  find <text>         item and fluid names containing text (e.g. find centrifuge)
+  find <text>         item and fluid names containing text (e.g. find centrifuge); an item's id works as its name
   tank                show the network of the tank/pipe whose window is open
   fill [fluid]        fill the tank/pipe whose window is open; name a fluid when it is empty
   empty               empty it (like the flush button)

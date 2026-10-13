@@ -27,7 +27,7 @@ disables achievements).
 | `give <item> <n>` | add n of an item as normal-quality stacks, never over the stack size |
 | `clear <item>` | remove every stack of an item from the listed inventory |
 | `swap <from> <to>` | replace all of one item with the same number of another (room checked first) |
-| `find <text>` | search item and fluid internal names (`find circuit`) |
+| `find <text>` | search item and fluid internal names (`find circuit`); an item's id from `find` works wherever an item name does (`chest fill 777`) |
 | `tank` | show the fluid network of the tank/pipe whose window is open (read-only) |
 | `fill [fluid]` | fill that network; name a fluid when it is empty (`fill water`) |
 | `empty` | empty it, like the flush button |
