@@ -940,7 +940,9 @@ void warnSlots(const std::vector<std::pair<u32, u32>>& slots, const std::vector<
 
 std::optional<Selector> parseSelector(const std::vector<std::string>& words) {
   Selector sel;
+  bool typed = false;  // something other than nothing was typed: "," must not mean "everything"
   for (auto& w : words) {
+    typed |= !w.empty();
     std::istringstream parts(w);
     for (std::string t; std::getline(parts, t, ',');) {
       if (t.empty()) continue;
@@ -953,6 +955,7 @@ std::optional<Selector> parseSelector(const std::vector<std::string>& words) {
       else return std::nullopt;
     }
   }
+  if (typed && sel.empty()) { std::puts("Nothing named - give items, #ids or slots (22, 22-90)."); return std::nullopt; }
   return sel;
 }
 
@@ -1102,16 +1105,18 @@ void clearPicked(const std::vector<std::string>& words) {
 constexpr u64 FILL = ~0ull;  // give(): as many as fit
 
 // Spawn `want` of a plain item into the picked inventory as normal-quality stacks.
-void give(const std::string& name, u64 want, const std::vector<std::pair<u32, u32>>& slots = {}) {
+// True when anything went in.
+bool give(const std::string& name, u64 want, const std::vector<std::pair<u32, u32>>& slots = {}) {
   u64 inv = picked();
   u32 id = inv ? itemId(name) : 0;
   Placement pl;
-  if (!id || !canGive(inv, id, pl)) return;
+  if (!id || !canGive(inv, id, pl)) return false;
   pl.slots = slots;
   u64 put = 0;
-  if (!editInventory(inv, [&] { put = placeItems(inv, pl, id, want); })) return;
+  if (!editInventory(inv, [&] { put = placeItems(inv, pl, id, want); })) return false;
   if (want == FILL) std::printf("Filled with %llu %s.\n", put, items[id].name.c_str());
   else std::printf("Gave %llu %s%s.\n", put, items[id].name.c_str(), put < want ? " (inventory full)" : "");
+  return put > 0;
 }
 
 // Replace every simple stack of `from` with the same number of `to`, in one edit, and only when
@@ -1160,8 +1165,7 @@ bool chestFill(const Selector& sel = {}) {
   u32 id = sel.ids.empty() ? firstItem(pick.inv) : sel.ids[0];
   if (!id) { if (sel.ids.empty()) std::puts("The chest is empty - name an item: chest fill <item>."); return false; }
   warnSlots(sel.slots, {pick.inv});
-  give(items[id].name, FILL, sel.slots);
-  return true;
+  return give(items[id].name, FILL, sel.slots);  // the F4 beep: high only when something went in
 }
 
 // Every chest of the open chest's kind (same class and prototype) in its block: a flood fill from
@@ -1384,6 +1388,8 @@ bool parseNames(const std::vector<std::string>& words, std::vector<u32>& itemIds
     std::istringstream parts(w);
     for (std::string t; std::getline(parts, t, ',');) if (!t.empty()) names.push_back(t);
   }
+  bool typed = std::any_of(words.begin(), words.end(), [](auto& w) { return !w.empty(); });
+  if (typed && names.empty()) { std::puts("Nothing named - give items, fluids, #ids or slots (22, 22-90)."); return false; }
   for (auto& n : names) {
     size_t dash = n.find('-');
     auto lo = number(n.substr(0, dash)), hi = dash == std::string::npos ? lo : number(n.substr(dash + 1));
@@ -1820,11 +1826,13 @@ void oreSet(u32 value) {
 // Yield shown in game = amount / ResourceEntityPrototype.normalAmount; set every well of the field.
 void oilSet(double tgt) {
   if (!ore.anchor || ptr(ore.anchor) != ore.vt1) { std::puts("Capture one well with `ore` first."); return; }
-  if (tgt <= 0) { std::puts("Usage: oil <target %>"); return; }
+  if (!(tgt > 0) || !std::isfinite(tgt)) { std::puts("Usage: oil <target %>"); return; }
   u32 normal = yieldBase(ore.proto);
   if (!normal) { std::puts("That resource has no yield baseline (not an oil-like resource)."); return; }
+  double amount = std::max(1.0, std::floor(tgt / 100.0 * normal + 0.5));
+  if (amount > UINT32_MAX) { std::printf("Refused: at most %.0f%% (the amount is a 32-bit number).\n", UINT32_MAX * 100.0 / normal); return; }
   if (!orePopulate(true)) return;
-  oreSet((u32)std::max(1.0, std::floor(tgt / 100.0 * normal + 0.5)));
+  oreSet((u32)amount);
 }
 
 // ---------------------------------------------------------------- hotkeys

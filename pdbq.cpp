@@ -55,12 +55,12 @@ std::wstring typeName(DWORD ti, int depth = 0) {
   }
 }
 
-void dumpType(const char* name) {
+bool dumpType(const char* name) {
   char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME]{};
   auto* si = (SYMBOL_INFO*)buf;
   si->SizeOfStruct = sizeof(SYMBOL_INFO);
   si->MaxNameLen = MAX_SYM_NAME;
-  if (!SymGetTypeFromName(h, BASE, name, si)) { std::printf("type %s not found (%lu)\n", name, GetLastError()); return; }
+  if (!SymGetTypeFromName(h, BASE, name, si)) { std::printf("type %s not found (%lu)\n", name, GetLastError()); return false; }
   ULONG64 size = 0;
   SymGetTypeInfo(h, BASE, si->TypeIndex, TI_GET_LENGTH, &size);
   std::printf("%s  size 0x%llX\n", name, size);
@@ -85,6 +85,7 @@ void dumpType(const char* name) {
       std::printf("  +0x%04lX  %5llX  %-60ls %ls\n", off, len, typeName(type).c_str(), symName(c).c_str());
   }
   free(p);
+  return true;
 }
 
 BOOL CALLBACK onSym(PSYMBOL_INFO si, ULONG, PVOID dataOnly) {
@@ -96,8 +97,11 @@ BOOL CALLBACK onSym(PSYMBOL_INFO si, ULONG, PVOID dataOnly) {
 
 int main(int argc, char** argv) {
   if (argc < 3) { std::puts("usage: pdbq type <Name> | sym <mask> | data <mask> | addr <rva>..."); return 2; }
+  std::string cmd = argv[1];
+  if (cmd != "type" && cmd != "sym" && cmd != "data" && cmd != "addr") { std::printf("unknown command %s\n", cmd.c_str()); return 2; }
   WCHAR env[MAX_PATH];
-  if (!GetEnvironmentVariableW(L"FACTORIO_EXE", env, MAX_PATH)) {
+  DWORD len = GetEnvironmentVariableW(L"FACTORIO_EXE", env, MAX_PATH);  // >= MAX_PATH: too long, env not filled
+  if (!len || len >= MAX_PATH) {
     std::puts("set FACTORIO_EXE to the full path of factorio.exe (factorio.pdb next to it)");
     return 2;
   }
@@ -108,8 +112,8 @@ int main(int argc, char** argv) {
     std::printf("load failed %lu\n", GetLastError());
     return 1;
   }
-  std::string cmd = argv[1];
-  if (cmd == "type") dumpType(argv[2]);
+  bool ok = true;  // exit status 1 when a query found nothing
+  if (cmd == "type") ok = dumpType(argv[2]);
   else if (cmd == "addr") {  // function containing an RVA
     char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME]{};
     auto* si = (SYMBOL_INFO*)buf;
@@ -118,8 +122,9 @@ int main(int argc, char** argv) {
     DWORD64 disp = 0;
     for (int i = 2; i < argc; ++i)
       if (SymFromAddr(h, BASE + strtoull(argv[i], nullptr, 16), &disp, si)) std::printf("%s = %s+0x%llX\n", argv[i], si->Name, disp);
-      else std::printf("%s = ?\n", argv[i]);
+      else { std::printf("%s = ?\n", argv[i]); ok = false; }
   }
-  else SymEnumSymbols(h, BASE, argv[2], onSym, cmd == "data" ? (PVOID)1 : nullptr);
+  else ok = SymEnumSymbols(h, BASE, argv[2], onSym, cmd == "data" ? (PVOID)1 : nullptr);
   SymCleanup(h);
+  return ok ? 0 : 1;
 }
