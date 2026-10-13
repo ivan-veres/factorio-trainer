@@ -1169,9 +1169,23 @@ std::vector<u64> openTrain() {
   return all;
 }
 
-// Names to item and fluid ids (a name can be both); false, with a message, on an unknown name.
-bool parseNames(const std::vector<std::string>& names, std::vector<u32>& itemIds, std::vector<u16>& fluidIds) {
+// Names (items, #ids, fluids; a name can be both item and fluid) and cargo slots (22, 22-90),
+// separated by spaces or commas; false, with a message, on an unknown name.
+bool parseNames(const std::vector<std::string>& words, std::vector<u32>& itemIds, std::vector<u16>& fluidIds,
+                std::vector<std::pair<u32, u32>>& slots) {
+  std::vector<std::string> names;
+  for (auto& w : words) {
+    std::istringstream parts(w);
+    for (std::string t; std::getline(parts, t, ',');) if (!t.empty()) names.push_back(t);
+  }
   for (auto& n : names) {
+    size_t dash = n.find('-');
+    auto lo = number(n.substr(0, dash)), hi = dash == std::string::npos ? lo : number(n.substr(dash + 1));
+    if (lo && hi) {
+      if (*lo > *hi) { std::printf("Slot range %s runs backwards.\n", n.c_str()); return false; }
+      slots.push_back({*lo, *hi});
+      continue;
+    }
     bool found = false;
     for (auto& [i, info] : items) if (info.name == n || hashId(n) == i) { itemIds.push_back(i); found = true; }
     for (auto& [i, f] : fluids) if (f == n) { fluidIds.push_back((u16)i); found = true; }
@@ -1201,10 +1215,12 @@ void trainFill(const std::vector<std::string>& names) {
   if (stock.empty()) { std::puts("Open a wagon or locomotive window of the train first."); return; }
   std::vector<u32> itemIds;
   std::vector<u16> fluidIds;
-  if (!parseNames(names, itemIds, fluidIds)) return;
+  std::vector<std::pair<u32, u32>> slots;  // cargo slots only, the same in every wagon
+  if (!parseNames(names, itemIds, fluidIds, slots)) return;
   u32 item = itemIds.empty() ? 0 : itemIds.back();
   u16 fluid = fluidIds.empty() ? 0 : fluidIds.back();
-  bool doCargo = names.empty() || item, doFluid = names.empty() || fluid;
+  bool none = itemIds.empty() && fluidIds.empty();
+  bool doCargo = none || item, doFluid = (none && slots.empty()) || fluid;
   if (L.fluidTemp != L.fluidId + 4 || L.fluidAmt != L.fluidId + 8) { std::puts("Fluid layout changed - refused."); return; }
 
   std::vector<u64> invs;
@@ -1225,6 +1241,7 @@ void trainFill(const std::vector<std::string>& names) {
       if (!id) { ++emptyCargo; continue; }
       Placement pl;
       if (!canGive(inv, id, pl)) continue;  // says why
+      pl.slots = slots;
       invs.push_back(inv); ids.push_back(id); pls.push_back(pl); labels.push_back(label);
     } else if (cls == "FluidWagon") {
       ++fluidWagons;
@@ -1428,8 +1445,9 @@ void trainClear(const std::vector<std::string>& names) {
   if (stock.empty()) { std::puts("Open a wagon or locomotive window of the train first."); return; }
   std::vector<u32> itemIds;
   std::vector<u16> fluidIds;
-  if (!parseNames(names, itemIds, fluidIds)) return;
-  bool doCargo = names.empty() || !itemIds.empty(), doFluid = names.empty() || !fluidIds.empty();
+  std::vector<std::pair<u32, u32>> slots;  // cargo slots, the same in every wagon
+  if (!parseNames(names, itemIds, fluidIds, slots)) return;
+  bool doCargo = names.empty() || !itemIds.empty() || !slots.empty(), doFluid = names.empty() || !fluidIds.empty();
   if (L.fluidTemp != L.fluidId + 4 || L.fluidAmt != L.fluidId + 8) { std::puts("Fluid layout changed - refused."); return; }
 
   std::vector<u64> invs, tanks;
@@ -1454,7 +1472,7 @@ void trainClear(const std::vector<std::string>& names) {
   std::map<std::string, u64> removed;
   std::map<std::string, double> drained;
   int kept = 0;
-  Selector sel{itemIds, {}};
+  Selector sel{itemIds, slots};
   int edited = editInventories(invs, [&](size_t i) { clearStacks(invs[i], sel, removed, kept); }, [&] {
     bool changed = !removed.empty();
     for (u64 t : tanks) {
@@ -1773,8 +1791,9 @@ const char* HELP = R"(Commands:
   chest fill all [item] / chest clear all [items]  the same for every chest of that kind in its block
   chest add | list | reset   pick chests anywhere: open one, `chest add`; repeat
   chest balance [all] [item] even out an item over the picked chests (all: the open chest's block)
-  train fill [names]  open wagon/locomotive: fill every wagon of its train (own item/fluid, or the named ones)
-  train clear [names] empty every wagon of the train (everything, or only the named items/fluids)
+  train fill [names]  open wagon/locomotive: fill every wagon of its train (own item/fluid, or the named ones;
+                      slots 22 / 22-90 limit every cargo wagon to those slots)
+  train clear [names] empty every wagon of the train (everything, or only the named items/fluids/slots)
   inv click           capture: then click an item in any inventory (car, wagon, ...)
   set <slot> <count>  set a stack count (simple items only)
   topup               fill every simple stack of the listed inventory to its max

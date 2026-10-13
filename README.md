@@ -21,8 +21,8 @@ disables achievements).
 | `chest fill all [item]` / `chest clear all [items]` | the same for every chest of that kind in its block, in one game stop |
 | `chest add` / `chest list` / `chest reset` | pick chests anywhere, one by one: open a chest's window, `chest add`; repeat |
 | `chest balance [item]` / `chest balance all [item]` | even out an item (normal quality, no item data) over the picked chests / the open chest's block, in one game stop; a chest with less room gets what fits, nothing is created or lost |
-| `train fill [names]` | with a wagon/locomotive window open: fill every cargo and fluid wagon (own item/fluid, or the named ones) |
-| `train clear [names]` | empty every wagon of that train (everything, or only the named items/fluids); locomotive fuel stays |
+| `train fill [names]` | with a wagon/locomotive window open: fill every cargo and fluid wagon (own item/fluid, or the named ones); slots `22` / `22-90` limit every cargo wagon to those slots (`train fill 0-9 #123`); names and slots take spaces or commas |
+| `train clear [names]` | empty every wagon of that train (everything, or only the named items/fluids, or cargo slots `22` / `22-90` in every wagon); locomotive fuel stays |
 | `inv click` | capture any other inventory by clicking an item in it (car, wagon, ...) |
 | `set <slot> <count>` | set a stack count (simple items only; above a stack only in your own inventory) |
 | `topup` | top up every simple stack of the listed inventory to its stack size |
