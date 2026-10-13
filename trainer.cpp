@@ -51,9 +51,27 @@ struct Game {
   std::wstring exe;
 } g;
 
-template <class T> bool rd(u64 a, T& v) {
+// While the game is frozen (atEndOfTick) nothing else writes its memory, so small reads are served
+// from 4 KB page copies: one ReadProcessMemory per page instead of one per field. Writes go through.
+struct PageCache { bool on = false; std::unordered_map<u64, std::vector<uint8_t>> pages; } cache;
+
+const uint8_t* cached(u64 a, size_t len) {
+  u64 p = a & ~0xFFFull;
+  if (!cache.on || a - p + len > 0x1000) return nullptr;
+  auto [it, fresh] = cache.pages.try_emplace(p);
   SIZE_T n = 0;
-  return a >= 0x10000 && ReadProcessMemory(g.proc, (LPCVOID)a, &v, sizeof v, &n) && n == sizeof v;
+  if (fresh) {
+    it->second.resize(0x1000);
+    if (!ReadProcessMemory(g.proc, (LPCVOID)p, it->second.data(), 0x1000, &n) || n != 0x1000) it->second.clear();
+  }
+  return it->second.empty() ? nullptr : it->second.data() + (a - p);
+}
+
+template <class T> bool rd(u64 a, T& v) {
+  if (a < 0x10000) return false;
+  if (auto c = cached(a, sizeof v)) { std::memcpy(&v, c, sizeof v); return true; }
+  SIZE_T n = 0;
+  return ReadProcessMemory(g.proc, (LPCVOID)a, &v, sizeof v, &n) && n == sizeof v;
 }
 template <class T> std::optional<T> rd(u64 a) {
   T v{};
@@ -63,7 +81,9 @@ template <class T> std::optional<T> rd(u64 a) {
 u64 ptr(u64 a) { return rd<u64>(a).value_or(0); }
 template <class T> bool wr(u64 a, T v) {
   SIZE_T n = 0;
-  return WriteProcessMemory(g.proc, (LPVOID)a, &v, sizeof v, &n) && n == sizeof v;
+  if (!WriteProcessMemory(g.proc, (LPVOID)a, &v, sizeof v, &n) || n != sizeof v) return false;
+  if (auto c = cached(a, sizeof v)) std::memcpy(const_cast<uint8_t*>(c), &v, sizeof v);
+  return true;
 }
 
 bool attach() {
@@ -218,6 +238,7 @@ struct Layout {
   u64 fluId, fluTemp, fluAmt, fluVol, fluFilterId, fluFilterMin, fluFilterMax, fluFilterCount, fluBoxesBegin, fluBoxesEnd;
   u64 boxSegment, boxConnBegin, boxConnEnd, connTarget, connOpposite, connFlags, connType, connSize, fpDefaultTemp, fpMaxTemp;
   u64 entProto, entPost, entX, entY, oreAmt, resNormal;
+  u64 entSurface, surfChunks, chunkPos, chunkAdvTiles, chunkAdvTilesSize, advTileSize;
   u64 protoTileSize, entConnector, connTile, connNextOnTile, connEntity, tileEntities, rsFront, rsBack, rsTrain, fwFluid, fwCapacity, trainManager, managerMap, mapTick, trainActivity, fluidId, fluidTemp, fluidAmt;
 } L;
 
@@ -319,6 +340,13 @@ bool loadLayout() {
   L.connNextOnTile = off("EntityConnector", "nextOnTile");
   L.connEntity = off("EntityConnector", "entity");
   L.tileEntities = off("AdvancedTile", "entities");
+  // ore / chest blocks: entities by position, from the per-tile entity lists of each chunk
+  L.entSurface = off("Entity", "surface");
+  L.surfChunks = off("Surface", "chunks");  // std::vector<Chunk*>
+  L.chunkPos = off("Chunk", "position");    // ChunkPosition {x, y}, chunks
+  L.chunkAdvTiles = off("Chunk", "advancedTiles");
+  L.chunkAdvTilesSize = pdb::size("ChunkAdvancedTiles");
+  L.advTileSize = pdb::size("AdvancedTile");
 
   // train fill: walk the rolling stock; fluid wagons hold one Fluid and a cached capacity
   L.rsFront = off("RollingStock", "connectedToFront") + L.targeterTarget;
@@ -447,7 +475,9 @@ template <class F> bool atEndOfTick(F frozen) {
   u64 flag = mem + SIZE - 8;
   bool detoured = false;
   bool hit = trap(L.sSortHook, nullptr, 3000, [&](CONTEXT& c) {
+    cache.on = true;
     std::vector<GameCall> calls = frozen();
+    cache = {};
     if (calls.empty()) return false;
     std::vector<uint8_t> code;
     auto b = [&](std::initializer_list<uint8_t> x) { code.insert(code.end(), x); };
@@ -527,8 +557,7 @@ void reloadNames() {
 // ---------------------------------------------------------------- inventory
 u16 firstNonFull(u64 inv);
 u16 lastNonEmpty(u64 inv);
-std::vector<u64> scanQword(u64 value);
-bool entityLive(u64 ent);
+std::vector<u64> sameKind(u64 anchor, int64_t reach);
 
 bool looksLikeInventory(u64 a) {
   u64 arr = ptr(a + L.invData);
@@ -969,40 +998,29 @@ bool chestFill(const std::string& name = "") {
   return true;
 }
 
-// Every chest of the open chest's kind (same class and prototype) in its block: a memory scan for
-// that class's vtable, like `ore`, then a flood fill from the open chest over chests whose centres
-// are at most w + max(1, w/2) tiles apart (w = prototype size; 6x6 warehouses: 9). Each is accepted
-// only if its main inventory's owner points back at it. Labels say where each one is.
+// Every chest of the open chest's kind (same class and prototype) in its block: a flood fill from
+// the open chest over chests whose centres are at most w + max(1, w/2) tiles apart (w = prototype
+// size; 6x6 warehouses: 9), like `ore`. Each is accepted only if its main inventory's owner points
+// back at it. Labels say where each one is.
 struct Block { std::vector<u64> invs; std::vector<std::string> labels; };
 
 Block openBlock() {
   u64 ent = openEntity();
   if (!mainInventory(ent)) { std::puts("Open one chest of the block first."); return {}; }
-  if (!entityLive(ent)) { std::puts("The open chest is not linked into its tile - refused."); return {}; }
-  u64 vt1 = ptr(ent), vt2 = ptr(ent + L.entPost), proto = ptr(ent + L.entProto);
+  u64 proto = ptr(ent + L.entProto);
   int32_t w = std::max(rd<int32_t>(proto + L.protoTileSize).value_or(1), rd<int32_t>(proto + L.protoTileSize + 4).value_or(1));
   int64_t reach = (int64_t)(w + std::max(1, w / 2)) * 256;  // positions are 1/256 tile
-  struct C { u64 ent, inv; int64_t x, y; };
-  std::vector<C> all;
-  int removed = 0;
-  for (u64 a : scanQword(vt1)) {
-    if (ptr(a + L.entPost) != vt2 || ptr(a + L.entProto) != proto) continue;
-    if (!entityLive(a)) { ++removed; continue; }
-    if (u64 inv = mainInventory(a)) all.push_back({a, inv, rd<int32_t>(a + L.entX).value_or(0), rd<int32_t>(a + L.entY).value_or(0)});
-  }
-  std::vector<C> block;
-  std::vector<bool> taken(all.size());
-  for (size_t i = 0; i < all.size(); ++i) if (all[i].ent == ent) { taken[i] = true; block.push_back(all[i]); }
-  for (size_t q = 0; q < block.size(); ++q)
-    for (size_t i = 0; i < all.size(); ++i)
-      if (!taken[i] && std::abs(all[i].x - block[q].x) <= reach && std::abs(all[i].y - block[q].y) <= reach) { taken[i] = true; block.push_back(all[i]); }
+  auto block = sameKind(ent, reach);
+  if (block.empty()) { std::puts("The open chest is not linked into its tile - refused."); return {}; }
   std::string kind = readStdString(proto + L.protoName).value_or("?");
-  std::printf("Block: %zu %s (of %zu on the map; %d removed ones still in memory ignored).\n", block.size(), kind.c_str(), all.size(), removed);
   Block b;
-  for (auto& c : block) {
-    b.invs.push_back(c.inv);
-    b.labels.push_back(kind + " at " + std::to_string(c.x >> 8) + "," + std::to_string(c.y >> 8));
-  }
+  for (u64 a : block)
+    if (u64 inv = mainInventory(a)) {
+      b.invs.push_back(inv);
+      b.labels.push_back(kind + " at " + std::to_string(rd<int32_t>(a + L.entX).value_or(0) >> 8) + "," +
+                         std::to_string(rd<int32_t>(a + L.entY).value_or(0) >> 8));
+    }
+  std::printf("Block: %zu %s.\n", b.invs.size(), kind.c_str());
   return b;
 }
 
@@ -1372,25 +1390,70 @@ void emptyOpen() {
 struct Ore { u64 anchor = 0, vt1 = 0, vt2 = 0, proto = 0; int reach = 1; std::vector<u64> tiles; } ore;
 u32 oreDefault = 500000;
 
-std::vector<u64> scanQword(u64 value) {
-  std::vector<u64> out, buf;
-  MEMORY_BASIC_INFORMATION mbi{};
-  for (u64 a = 0x10000; a < 0x7FFFFFFFFFFF && VirtualQueryEx(g.proc, (LPCVOID)a, &mbi, sizeof mbi); a = (u64)mbi.BaseAddress + mbi.RegionSize) {
-    if (mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE || mbi.Protect != PAGE_READWRITE) continue;
-    for (u64 off = 0; off < mbi.RegionSize; off += 64ull << 20) {
-      u64 len = std::min<u64>(64ull << 20, mbi.RegionSize - off), at = (u64)mbi.BaseAddress + off;
-      buf.resize(len / 8);
-      SIZE_T n = 0;
-      if (!ReadProcessMemory(g.proc, (LPCVOID)at, buf.data(), len, &n)) continue;
-      for (u64 i = 0; i < n / 8; ++i) if (buf[i] == value) out.push_back(at + i * 8);
+// Entities of the anchor's kind (both vtables and prototype) chained to it at most `reach` apart
+// (1/256 tile, per axis), anchor first; empty when the anchor is not on the map. Read from the
+// per-tile entity lists of only the chunks the chain reaches (Surface.chunks -> Chunk.advancedTiles
+// -> EntityConnector.nextOnTile), not by scanning the game's memory: a removed entity is unlinked
+// from those lists even though its freed memory keeps the old bytes.
+std::vector<u64> sameKind(u64 anchor, int64_t reach) {
+  u64 vt1 = ptr(anchor), vt2 = ptr(anchor + L.entPost), proto = ptr(anchor + L.entProto), surface = ptr(anchor + L.entSurface);
+  auto key = [](int64_t x, int64_t y) { return x << 32 ^ (u32)y; };
+  std::unordered_map<int64_t, u64> chunks;  // chunk position -> Chunk
+  u64 b = ptr(surface + L.surfChunks), e = ptr(surface + L.surfChunks + 8);
+  std::vector<u64> list(e > b && e - b < (1ull << 28) ? (e - b) / 8 : 0);
+  SIZE_T n = 0;
+  if (!list.empty() && ReadProcessMemory(g.proc, (LPCVOID)b, list.data(), list.size() * 8, &n))
+    for (u64 c : list)
+      if (int32_t p[2]; rd(c + L.chunkPos, p)) chunks[key(p[0], p[1])] = c;
+
+  struct Hit { u64 ent; int64_t x, y; };
+  std::vector<Hit> found;  // every entity of the kind in the chunks read so far
+  std::unordered_map<u64, bool> seen;
+  std::unordered_map<int64_t, bool> loaded;
+  std::vector<uint8_t> tiles(L.chunkAdvTilesSize);
+  auto load = [&](int64_t cx, int64_t cy) {
+    auto it = chunks.find(key(cx, cy));
+    if (loaded[key(cx, cy)] || it == chunks.end()) return;
+    loaded[key(cx, cy)] = true;
+    if (!ReadProcessMemory(g.proc, (LPCVOID)(it->second + L.chunkAdvTiles), tiles.data(), tiles.size(), &n)) return;
+    for (size_t t = 0; t + L.advTileSize <= tiles.size(); t += L.advTileSize) {
+      u64 c = 0;
+      std::memcpy(&c, tiles.data() + t + L.tileEntities, 8);
+      for (int i = 0; c && i < 4096; ++i, c = ptr(c + L.connNextOnTile)) {
+        u64 ent = ptr(c + L.connEntity);
+        if (seen[ent] || ptr(ent) != vt1 || ptr(ent + L.entPost) != vt2 || ptr(ent + L.entProto) != proto) continue;
+        seen[ent] = true;
+        found.push_back({ent, rd<int32_t>(ent + L.entX).value_or(0), rd<int32_t>(ent + L.entY).value_or(0)});
+      }
     }
+  };
+  constexpr int64_t CHUNK = 32 * 256;
+  auto chunkOf = [](int64_t v) { return v >> 13; };  // arithmetic shift = floor(/CHUNK)
+  static_assert(CHUNK == 1 << 13);
+  int64_t ax = rd<int32_t>(anchor + L.entX).value_or(0), ay = rd<int32_t>(anchor + L.entY).value_or(0);
+  load(chunkOf(ax), chunkOf(ay));
+  if (!seen[anchor]) return {};
+
+  std::vector<Hit> block{{anchor, ax, ay}};
+  std::vector<bool> taken;
+  for (size_t q = 0; q < block.size(); ++q) {
+    auto [_, x, y] = block[q];
+    for (int64_t cx = chunkOf(x - reach); cx <= chunkOf(x + reach); ++cx)
+      for (int64_t cy = chunkOf(y - reach); cy <= chunkOf(y + reach); ++cy) load(cx, cy);
+    taken.resize(found.size());
+    for (size_t i = 0; i < found.size(); ++i)
+      if (!taken[i] && found[i].ent != anchor && std::abs(found[i].x - x) <= reach && std::abs(found[i].y - y) <= reach) {
+        taken[i] = true;
+        block.push_back(found[i]);
+      }
   }
+  std::vector<u64> out;
+  for (auto& h : block) out.push_back(h.ent);
   return out;
 }
 
-// A memory scan also finds removed entities: their memory is freed but keeps the old bytes until it
-// is reused. A live entity is linked into the entity list of its tile (Entity.connector); a removed
-// one was unlinked, so walk that list from the tile's side and look for this entity's connector.
+// Whether the entity is still linked into its tile's entity list (Entity.connector): walk that list
+// from the tile's side and look for this entity's connector.
 bool entityLive(u64 ent) {
   u64 conn = ent + L.entConnector, tile = ptr(conn + L.connTile);
   if (!tile || ptr(conn + L.connEntity) != ent) return false;
@@ -1412,29 +1475,9 @@ bool orePopulate(bool quiet = false) {
   ore.tiles.clear();
   if (!ore.vt1 || !ore.vt2 || !ore.proto) { std::puts("Captured address is not an entity - capture again."); return false; }
 
-  std::unordered_map<int64_t, u64> byTile;
-  auto key = [](int32_t x, int32_t y) { return ((int64_t)x << 32) ^ (u32)y; };
-  for (u64 a : scanQword(ore.vt1)) {
-    if (ptr(a + L.entPost) != ore.vt2 || ptr(a + L.entProto) != ore.proto || !entityLive(a)) continue;
-    auto x = rd<int32_t>(a + L.entX), y = rd<int32_t>(a + L.entY);
-    if (x && y) byTile[key(*x >> 8, *y >> 8)] = a;  // arithmetic shift = floor(/256)
-  }
-  int32_t ax = rd<int32_t>(ore.anchor + L.entX).value_or(0) >> 8, ay = rd<int32_t>(ore.anchor + L.entY).value_or(0) >> 8;
-  std::vector<std::pair<int32_t, int32_t>> queue{{ax, ay}};
-  std::unordered_map<int64_t, bool> taken{{key(ax, ay), true}};
+  ore.tiles = sameKind(ore.anchor, ore.reach * 256);  // tile centres: 256 apart per tile
   u64 total = 0;
-  for (size_t qi = 0; qi < queue.size(); ++qi) {
-    auto [tx, ty] = queue[qi];
-    auto it = byTile.find(key(tx, ty));
-    if (it == byTile.end()) continue;
-    ore.tiles.push_back(it->second);
-    total += rd<u32>(it->second + L.oreAmt).value_or(0);
-    for (int dx = -ore.reach; dx <= ore.reach; ++dx)
-      for (int dy = -ore.reach; dy <= ore.reach; ++dy) {
-        int64_t k = key(tx + dx, ty + dy);
-        if (!taken[k] && byTile.count(k)) { taken[k] = true; queue.push_back({tx + dx, ty + dy}); }
-      }
-  }
+  for (u64 a : ore.tiles) total += rd<u32>(a + L.oreAmt).value_or(0);
   std::string name = readStdString(ore.proto + L.protoName).value_or("?");
   if (!quiet && normal)
     std::printf("%s: %zu wells in this field, the hovered one at %.0f%%. Check the count against the map, then `oil <target %%>`.\n",

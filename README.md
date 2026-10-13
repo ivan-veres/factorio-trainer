@@ -151,13 +151,17 @@ with `pdbq` and `objdump` (disassembly of the exact function, named by the PDB):
   `Map.entityTick`, which is all `FluidWagon::setFluid` does besides the write. Locomotives, and the fuel in them, are never touched (verified in game: `train clear rocket-fuel`
   emptied the wagons and left the locomotives' fuel). Every wagon is edited in
   the same end-of-tick stop, and their `inventorySorted` calls run from one stub.
-- **`chest fill all` / `chest clear all`.** From the open chest, a memory scan for its class's vtable
-  (like `ore`) finds every chest of the same prototype; a flood fill keeps those whose centres are at
-  most `w + max(1, w/2)` tiles apart (`EntityPrototype.tileGridSizeStored`; 6x6 warehouses: 9). Each
-  must pass the owner check and be live: a removed entity's freed memory keeps its old bytes (vtable,
-  prototype, inventory) until reused, so the scan finds it too. A live one is linked into its tile's
-  entity list (`Entity.connector` -> `AdvancedTile.entities` -> `nextOnTile`); that list is walked from
-  the tile's side (`entityLive`). The ore scan uses the same check. All are edited in one end-of-tick stop.
+- **`chest fill all` / `chest clear all` and `ore`.** From the open chest (or the hovered ore tile), a
+  flood fill collects every entity of the same class and prototype whose centres are at most
+  `w + max(1, w/2)` tiles apart (`EntityPrototype.tileGridSizeStored`; 6x6 warehouses: 9; ore: 1, oil
+  wells: 12). It reads only the chunks the fill reaches: `Entity.surface` -> `Surface.chunks` ->
+  `Chunk.position` and `Chunk.advancedTiles`, each tile's entity list (`AdvancedTile.entities` ->
+  `EntityConnector.nextOnTile` -> `entity`). There is no memory scan: removed entities are unlinked
+  from those lists even though their freed memory keeps the old bytes. Chests must also pass the owner
+  check. All are edited in one end-of-tick stop.
+- **Reads while the game is stopped.** During the end-of-tick stop nothing else writes the game's
+  memory, so reads come from 4 KB page copies (one `ReadProcessMemory` per page, not per field) and
+  writes go through to the game and the copy. That keeps the stop short for large blocks and trains.
 - **Picked inventories are re-validated.** A reload or a mined chest frees the inventory and the heap
   reuses the memory, so `inv`/`chest`/`inv click` remember the inventory's and its owner's vtables
   and owner pointer, and every command checks them before touching it.
