@@ -17,7 +17,7 @@ disables achievements).
 | `inv` | your character's main inventory, no clicking |
 | `chest` | the chest, cargo wagon, car or spidertron whose window is open in game |
 | `chest fill [item]` | fill the open chest's free slots (up to its limit bar) with its first item, or the named one |
-| `chest clear [items]` | empty the open chest, or remove only the named items |
+| `chest clear [what]` | empty the open chest, or remove only what is named: items, item ids `#777`, slots `22` or ranges `22-90`, separated by spaces or commas (`chest clear stone,#777 5-20`) |
 | `chest fill all [item]` / `chest clear all [items]` | the same for every chest of that kind in its block, in one game stop |
 | `chest add` / `chest list` / `chest reset` | pick chests anywhere, one by one: open a chest's window, `chest add`; repeat |
 | `chest balance [item]` / `chest balance all [item]` | even out an item (normal quality, no item data) over the picked chests / the open chest's block, in one game stop; a chest with less room gets what fits, nothing is created or lost |
@@ -27,9 +27,9 @@ disables achievements).
 | `set <slot> <count>` | set a stack count (simple items only; above a stack only in your own inventory) |
 | `topup` | top up every simple stack of the listed inventory to its stack size |
 | `give <item> <n>` | add n of an item as normal-quality stacks, never over the stack size |
-| `clear <item>` | remove every stack of an item from the listed inventory |
+| `clear <what>` | the same selection on the listed inventory (something must be named) |
 | `swap <from> <to>` | replace all of one item with the same number of another (room checked first) |
-| `find <text>` | search item and fluid internal names (`find circuit`); an item's id from `find` works wherever an item name does (`chest fill 777`) |
+| `find <text>` | search item and fluid internal names (`find circuit`); an item's id, written `#777` as `find` and the listings show it, works wherever an item name does (`chest fill #777`) |
 | `tank` | show the fluid network of the tank/pipe whose window is open (read-only) |
 | `fill [fluid]` | fill that network; name a fluid when it is empty (`fill water`) |
 | `empty` | empty it, like the flush button |

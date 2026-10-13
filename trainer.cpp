@@ -671,7 +671,7 @@ void invList() {
     if (ptr(a + L.stackItem)) note = "[item data - not editable]";
     else if (it != items.end() && it->second.unstackable) note = "[unstackable]";
     else if (it != items.end()) note = "[max " + std::to_string(it->second.stack) + "]";
-    std::printf("  %3u  %-40s id %-5u %8u  %s\n", i, name.c_str(), id, cnt, note.c_str());
+    std::printf("  %3u  %-40s #%-5u %8u  %s\n", i, name.c_str(), id, cnt, note.c_str());
   }
 }
 
@@ -865,12 +865,48 @@ std::optional<u32> number(const std::string& s) {
   return ec == std::errc{} && end == s.data() + s.size() ? std::optional(v) : std::nullopt;
 }
 
-// An item by internal name or by the id `find` shows.
+// An item id written #123 (as `find` and the listings show it), or nothing.
+std::optional<u32> hashId(const std::string& s) {
+  return s.size() > 1 && s[0] == '#' ? number(s.substr(1)) : std::nullopt;
+}
+
+// An item by internal name or by its id (#123).
 u32 itemId(const std::string& name) {
-  if (auto k = number(name); k && items.count(*k)) return *k;
+  if (auto k = hashId(name); k && items.count(*k)) return *k;
   for (auto& [i, info] : items) if (info.name == name) return i;
-  std::printf("No item named or numbered '%s' (try `find`).\n", name.c_str());
+  std::printf("No item '%s' (try `find`; item ids are written #123).\n", name.c_str());
   return 0;
+}
+
+// What `clear` and `chest clear` remove: item names, item ids (#123), slots (22) and slot ranges
+// (22-90), separated by spaces or commas. Nothing selected means everything.
+struct Selector {
+  std::vector<u32> ids;
+  std::vector<std::pair<u32, u32>> slots;
+  bool empty() const { return ids.empty() && slots.empty(); }
+  bool takes(u32 slot, u32 id) const {
+    if (empty() || std::find(ids.begin(), ids.end(), id) != ids.end()) return true;
+    for (auto [a, b] : slots) if (slot >= a && slot <= b) return true;
+    return false;
+  }
+};
+
+std::optional<Selector> parseSelector(const std::vector<std::string>& words) {
+  Selector sel;
+  for (auto& w : words) {
+    std::istringstream parts(w);
+    for (std::string t; std::getline(parts, t, ',');) {
+      if (t.empty()) continue;
+      size_t dash = t.find('-');
+      auto lo = number(t.substr(0, dash)), hi = dash == std::string::npos ? lo : number(t.substr(dash + 1));
+      if (lo && hi) {
+        if (*lo > *hi) { std::printf("Slot range %s runs backwards.\n", t.c_str()); return std::nullopt; }
+        sel.slots.push_back({*lo, *hi});
+      } else if (u32 id = itemId(t)) sel.ids.push_back(id);
+      else return std::nullopt;
+    }
+  }
+  return sel;
 }
 
 // Where give may put an item: normal-quality stacks below the limit bar, in slots whose filter
@@ -960,15 +996,21 @@ u64 removeItems(u64 inv, u32 id, int* kept = nullptr) {
   return removed;
 }
 
-// Remove every simple stack of `name` (any quality) from the picked inventory.
-void clearItem(const std::string& name) {
+void clearStacks(u64 inv, const Selector& sel, std::map<std::string, u64>& removed, int& kept);
+void printRemoved(const std::map<std::string, u64>& removed, int kept);
+
+// Remove what the selector names (items, #ids, slots) from the picked inventory; something must be
+// named, so a typo never empties your own inventory.
+void clearPicked(const std::vector<std::string>& words) {
   u64 inv = picked();
-  u32 id = inv ? itemId(name) : 0;
-  if (!id) return;
-  u64 removed = 0;
+  auto sel = inv ? parseSelector(words) : std::nullopt;
+  if (!sel) return;
+  if (sel->empty()) { std::puts("Usage: clear <items, #ids, slots 22 or 22-90>"); return; }
+  std::map<std::string, u64> removed;
   int kept = 0;
-  if (!editInventory(inv, [&] { removed = removeItems(inv, id, &kept); })) return;
-  std::printf("Removed %llu %s%s.\n", removed, items[id].name.c_str(), kept ? " (stacks with item data left in place)" : "");
+  if (!editInventory(inv, [&] { clearStacks(inv, *sel, removed, kept); })) return;
+  printRemoved(removed, kept);
+  if (removed.empty()) std::puts("  nothing to remove");
 }
 
 constexpr u64 FILL = ~0ull;  // give(): as many as fit
@@ -1124,7 +1166,7 @@ std::vector<u64> openTrain() {
 bool parseNames(const std::vector<std::string>& names, std::vector<u32>& itemIds, std::vector<u16>& fluidIds) {
   for (auto& n : names) {
     bool found = false;
-    for (auto& [i, info] : items) if (info.name == n || number(n) == i) { itemIds.push_back(i); found = true; }  // a number is an item id
+    for (auto& [i, info] : items) if (info.name == n || hashId(n) == i) { itemIds.push_back(i); found = true; }
     for (auto& [i, f] : fluids) if (f == n) { fluidIds.push_back((u16)i); found = true; }
     if (!found) { std::printf("No item or fluid named '%s' (try `find`).\n", n.c_str()); return false; }
   }
@@ -1229,15 +1271,15 @@ void trainFill(const std::vector<std::string>& names) {
   if (emptyCargo || emptyFluid) std::printf("  %d empty skipped (name an item or fluid to fill those)\n", emptyCargo + emptyFluid);
 }
 
-// Zero every simple stack of the listed items (all items when the list is empty); per-name totals
-// go to `removed`, stacks with item data are counted in `kept` and left in place.
-void clearStacks(u64 inv, const std::vector<u32>& ids, std::map<std::string, u64>& removed, int& kept) {
+// Zero every simple stack the selector takes (everything when it is empty); per-name totals go to
+// `removed`, stacks with item data are counted in `kept` and left in place.
+void clearStacks(u64 inv, const Selector& sel, std::map<std::string, u64>& removed, int& kept) {
   u64 arr = ptr(inv + L.invData);
   u16 total = rd<u16>(inv + L.invSize).value_or(0);
   for (u32 j = 0; j < total; ++j) {
     u64 a = arr + j * L.stackSize;
     u16 sid = rd<u16>(a + L.stackId).value_or(0);
-    if (!sid || (!ids.empty() && std::find(ids.begin(), ids.end(), (u32)sid) == ids.end())) continue;
+    if (!sid || !sel.takes(j, sid)) continue;
     if (ptr(a + L.stackItem)) { ++kept; continue; }
     u32 cnt = rd<u32>(a + L.stackCount).value_or(0);
     if (wr<u64>(a, 0)) removed[items.count(sid) ? items[sid].name : "id " + std::to_string(sid)] += cnt;
@@ -1250,10 +1292,11 @@ void printRemoved(const std::map<std::string, u64>& removed, int kept) {
 }
 
 // Empty the open chest (one) or every chest of its block (all) in one game stop: everything, or
-// only the named items.
-void chestClear(bool all, const std::vector<std::string>& names) {
-  std::vector<u32> ids;
-  for (auto& n : names) if (u32 id = itemId(n)) ids.push_back(id); else return;
+// only what the selector names (items, #ids, slots; slots only for one chest).
+void chestClear(bool all, const std::vector<std::string>& words) {
+  auto sel = parseSelector(words);
+  if (!sel) return;
+  if (all && !sel->slots.empty()) { std::puts("Slot numbers need one chest: `chest clear <slots>` without `all`."); return; }
   Block b;
   if (all) b = openBlock();
   else if (setPick(openChest()), pick.inv) b = {{pick.inv}, {}};
@@ -1261,7 +1304,7 @@ void chestClear(bool all, const std::vector<std::string>& names) {
   if (b.invs.empty()) return;
   std::map<std::string, u64> removed;
   int kept = 0;
-  if (editInventories(b.invs, [&](size_t i) { clearStacks(b.invs[i], ids, removed, kept); }, [] {}, b.labels) < 0) return;
+  if (editInventories(b.invs, [&](size_t i) { clearStacks(b.invs[i], *sel, removed, kept); }, [] {}, b.labels) < 0) return;
   printRemoved(removed, kept);
   if (removed.empty()) std::puts("  nothing to remove");
 }
@@ -1404,7 +1447,8 @@ void trainClear(const std::vector<std::string>& names) {
   std::map<std::string, u64> removed;
   std::map<std::string, double> drained;
   int kept = 0;
-  int edited = editInventories(invs, [&](size_t i) { clearStacks(invs[i], itemIds, removed, kept); }, [&] {
+  Selector sel{itemIds, {}};
+  int edited = editInventories(invs, [&](size_t i) { clearStacks(invs[i], sel, removed, kept); }, [&] {
     bool changed = !removed.empty();
     for (u64 t : tanks) {
       Fl cur{};
@@ -1718,7 +1762,7 @@ const char* HELP = R"(Commands:
   inv                 your character's main inventory (no clicking)
   chest               the chest/wagon/car whose window is open in game (no clicking)
   chest fill [item]   fill its free slots with the item in its first slot (or the named one)
-  chest clear [items] empty it (everything, or only the named items)
+  chest clear [what]  empty it, or only what is named: items, #ids, slots 22 or 22-90 (spaces or commas)
   chest fill all [item] / chest clear all [items]  the same for every chest of that kind in its block
   chest add | list | reset   pick chests anywhere: open one, `chest add`; repeat
   chest balance [all] [item] even out an item over the picked chests (all: the open chest's block)
@@ -1728,9 +1772,9 @@ const char* HELP = R"(Commands:
   set <slot> <count>  set a stack count (simple items only)
   topup               fill every simple stack of the listed inventory to its max
   give <item> <n>     add n of an item as normal stacks (e.g. give electronic-circuit 2000)
-  clear <item>        remove every stack of an item from the listed inventory
+  clear <what>        remove from the listed inventory: items, #ids, slots 22 or 22-90
   swap <from> <to>    replace all of one item with the same number of another
-  find <text>         item and fluid names containing text (e.g. find centrifuge); an item's id works as its name
+  find <text>         item and fluid names containing text (e.g. find centrifuge); #id works as an item name
   tank                show the network of the tank/pipe whose window is open
   fill [fluid]        fill the tank/pipe whose window is open; name a fluid when it is empty
   empty               empty it (like the flush button)
@@ -1830,14 +1874,18 @@ int main(int argc, char** argv) {
     }
     else if (cmd == "oil") { double t; std::istringstream a(line.substr(3)); if (a >> t) oilSet(t); else std::puts("Usage: oil <target %>"); }
     else if (cmd == "give") { u64 n; if (!arg.empty() && rest >> n && n) give(arg, n); else std::puts("Usage: give <item-name> <count>"); }
-    else if (cmd == "clear") { if (arg.empty()) std::puts("Usage: clear <item>"); else clearItem(arg); }
+    else if (cmd == "clear") {
+      std::vector<std::string> words{arg};
+      for (std::string w; rest >> w;) words.push_back(w);
+      clearPicked(words);
+    }
     else if (cmd == "swap") { std::string to; if (arg.empty() || !(rest >> to)) std::puts("Usage: swap <from-item> <to-item>"); else swapItems(arg, to); }
     else if (cmd == "find" && !arg.empty()) {
       std::map<std::string, std::string> hits;  // sorted output
       for (auto& [i, info] : items)
         if (info.name.find(arg) != std::string::npos)
-          hits[info.name] = "item  id " + std::to_string(i) + (info.unstackable ? "  unstackable" : "  stack " + std::to_string(info.stack));
-      for (auto& [i, n] : fluids) if (n.find(arg) != std::string::npos) hits[n] = "fluid id " + std::to_string(i);
+          hits[info.name] = "item  #" + std::to_string(i) + (info.unstackable ? "  unstackable" : "  stack " + std::to_string(info.stack));
+      for (auto& [i, n] : fluids) if (n.find(arg) != std::string::npos) hits[n] = "fluid";
       for (auto& [n, what] : hits) std::printf("  %-45s %s\n", n.c_str(), what.c_str());
       if (hits.empty()) std::puts("  nothing matches");
     }
